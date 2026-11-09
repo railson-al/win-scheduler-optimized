@@ -1,0 +1,25 @@
+[package]
+name = "scriptrunner-service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+clap = { version = "4.6.7", features = ["derive", "env"] }
+scriptrunner-core = { version = "0.1.0", path = "../core" }
+scriptrunner-storage = { version = "0.1.0", path = "../storage" }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "fs", "process", "io-util"] }
+tokio-util = "0.7.20"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[[bin]]
+name = "scriptrunner"
+path = "src/main.rs"
+
+[dev-dependencies]
+tempfile = "3.27.0"
