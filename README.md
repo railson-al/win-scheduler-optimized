@@ -4,8 +4,8 @@ Agendador de scripts para Windows escrito em Rust: cadastra, agenda, executa e m
 scripts (`.py`, `.bat`, `.cmd`, `.ps1`, `.exe`) com histórico e logs, sem depender do
 Task Scheduler.
 
-**Estado atual:** Fase 1 (motor) pronta. Serviço Windows, IPC e GUI (egui) ainda não existem;
-por enquanto há uma CLI de desenvolvimento (`scriptrunner`).
+**Estado atual:** motor (fase 1) e IPC local (leva 1) prontos. O `daemon` roda em modo console e a CLI
+`scriptrunner` fala com ele por IPC. Serviço Windows e GUI (egui) ainda não existem.
 
 ## Estrutura
 
@@ -13,7 +13,8 @@ por enquanto há uma CLI de desenvolvimento (`scriptrunner`).
 |---|---|
 | `crates/core` | Modelos, cálculo de agendamento, executor de processos, logs |
 | `crates/storage` | SQLite: tarefas, histórico, retenção, configurações |
-| `crates/service` | Motor (agendador + execuções) e a CLI `scriptrunner` |
+| `crates/ipc` | Protocolo (frames JSON), transporte (named pipe / socket Unix) e cliente; não depende de SQLite |
+| `crates/service` | Motor (agendador + execuções), servidor IPC e a CLI `scriptrunner` |
 
 ## Compilar e testar no Windows
 
@@ -29,8 +30,19 @@ O executável fica em `target\release\scriptrunner.exe`.
 
 ## Usar a CLI
 
+O `daemon` é o dono do banco e do agendador. Todos os outros comandos são clientes dele por IPC
+(named pipe `\\.\pipe\scriptrunner` no Windows; socket em `<data_dir>/ipc/` no Linux). Sem o daemon
+rodando, eles falham com uma mensagem clara. Use dois terminais:
+
 ```powershell
+# Terminal 1: o daemon
 $env:SCRIPTRUNNER_DATA_DIR = "C:\sr-teste\data"   # onde ficam o banco e os logs
+.\target\release\scriptrunner.exe daemon          # Ctrl+C para sair
+```
+
+```powershell
+# Terminal 2: os comandos
+$env:SCRIPTRUNNER_DATA_DIR = "C:\sr-teste\data"
 $sr = ".\target\release\scriptrunner.exe"
 
 & $sr add "Backup" "C:\scripts\backup.py" --every 15m
@@ -41,8 +53,7 @@ $sr = ".\target\release\scriptrunner.exe"
 & $sr list
 & $sr run Backup          # executa agora, mostrando a saída
 & $sr history             # histórico
-& $sr logs <id-da-execucao>
-& $sr daemon              # roda o agendador em primeiro plano (Ctrl+C para sair)
+& $sr logs <id-da-execucao>   # aceita o id completo ou um prefixo único
 ```
 
 Outros comandos: `enable`, `disable`, `delete`.
@@ -53,6 +64,14 @@ Outros comandos: `enable`, `disable`, `delete`.
 - `-ExecutionPolicy Bypass` em `.ps1`.
 - Timeout/stop encerra o script **e os filhos** (Job Object); nenhuma janela de console aparece.
 - `daemon` dispara 1 execução por slot, sem duplicatas; slots perdidos viram `skipped (missed…)`.
+
+Checklist do IPC (só dá para confirmar no Windows):
+
+1. `scriptrunner daemon` sobe e cria o pipe `\\.\pipe\scriptrunner`.
+2. `scriptrunner list` em outro terminal responde. Com o daemon parado, ele diz que o daemon não está rodando.
+3. Uma execução `.bat` aparece em tempo real no `run`, com acentos corretos.
+4. Fechar o daemon com Ctrl+C e subir de novo preserva tarefas e histórico.
+5. Um segundo `daemon` falha com mensagem clara, em vez de duplicar o agendador.
 
 ## Integração contínua e versão do Rust
 

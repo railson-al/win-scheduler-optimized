@@ -2,3 +2,4 @@
 //! front end (CLI today, Windows service + GUI later) talks to.
 
 pub mod engine;
+pub mod ipc_server;

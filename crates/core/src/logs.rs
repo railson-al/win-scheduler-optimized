@@ -10,10 +10,12 @@ use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 
 use chrono::{DateTime, TimeZone, Utc};
+use serde::{Deserialize, Serialize};
 
 use crate::executor::{LogLine, LogStream};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LogKind {
     Stdout,
     Stderr,
@@ -49,7 +51,7 @@ impl From<LogStream> for LogKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogEntry {
     pub at: DateTime<Utc>,
     pub kind: LogKind,

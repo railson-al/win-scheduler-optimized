@@ -15,6 +15,9 @@ use scriptrunner_core::{
 };
 use thiserror::Error;
 
+// Moved to `core` so IPC clients need not depend on SQLite; re-exported so existing callers keep working.
+pub use scriptrunner_core::ExecutionQuery;
+
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("database error: {0}")]
@@ -79,16 +82,6 @@ CREATE TABLE settings (
     value_json TEXT NOT NULL
 );
 "#];
-
-#[derive(Debug, Clone, Default)]
-pub struct ExecutionQuery {
-    pub task_id: Option<TaskId>,
-    pub status: Option<ExecutionStatus>,
-    pub since: Option<DateTime<Utc>>,
-    pub until: Option<DateTime<Utc>>,
-    pub limit: Option<u32>,
-    pub offset: u32,
-}
 
 /// A schedule's stored next slot.
 #[derive(Debug, Clone, PartialEq, Eq)]

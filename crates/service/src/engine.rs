@@ -6,8 +6,10 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Local, Utc};
 use scriptrunner_core::executor::{self, LogLine, RunOutcome};
 use scriptrunner_core::logs::{self, LogEntry, LogWriter};
-use scriptrunner_core::{CoreError, Execution, ExecutionId, ExecutionStatus, Settings, Task, TaskId, Trigger};
-use scriptrunner_storage::{ExecutionQuery, ScheduledSlot, Storage, StorageError};
+use scriptrunner_core::{
+    CoreError, Execution, ExecutionId, ExecutionQuery, ExecutionStatus, Settings, Task, TaskId, TaskOverview, Trigger,
+};
+use scriptrunner_storage::{ScheduledSlot, Storage, StorageError};
 use thiserror::Error;
 use tokio::sync::{Notify, Semaphore, SemaphorePermit, broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -44,15 +46,6 @@ pub enum Event {
     TasksChanged,
     /// Fired when an execution is registered, starts, or finishes.
     ExecutionChanged(Execution),
-}
-
-/// One dashboard row.
-#[derive(Debug, Clone)]
-pub struct TaskOverview {
-    pub task: Task,
-    pub running: bool,
-    pub last_execution: Option<Execution>,
-    pub next_run: Option<DateTime<Utc>>,
 }
 
 struct ActiveRun {
@@ -269,14 +262,21 @@ impl Engine {
         let Some(file) = self.log_file_of(id)? else {
             return Ok(Vec::new());
         };
-        Ok(logs::read_log(&self.inner.logs_dir.join(file), skip, limit)?)
+        // A log file removed behind our back (manual cleanup) reads as empty, not as a failure.
+        match logs::read_log(&self.inner.logs_dir.join(file), skip, limit) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            other => Ok(other?),
+        }
     }
 
     pub fn export_log(&self, id: &ExecutionId) -> Result<String> {
         let Some(file) = self.log_file_of(id)? else {
             return Ok(String::new());
         };
-        Ok(logs::export_text(&self.inner.logs_dir.join(file))?)
+        match logs::export_text(&self.inner.logs_dir.join(file)) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+            other => Ok(other?),
+        }
     }
 
     fn log_file_of(&self, id: &ExecutionId) -> Result<Option<String>> {

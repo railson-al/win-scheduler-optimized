@@ -323,9 +323,39 @@ impl Settings {
     }
 }
 
+/// Filter and paging for execution history queries. Lives in `core` (not
+/// `storage`) because it travels over IPC, and clients must not need SQLite.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExecutionQuery {
+    pub task_id: Option<TaskId>,
+    pub status: Option<ExecutionStatus>,
+    pub since: Option<DateTime<Utc>>,
+    pub until: Option<DateTime<Utc>>,
+    pub limit: Option<u32>,
+    pub offset: u32,
+}
+
+/// One dashboard row.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskOverview {
+    pub task: Task,
+    pub running: bool,
+    pub last_execution: Option<Execution>,
+    pub next_run: Option<DateTime<Utc>>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn execution_query_accepts_partial_json() {
+        let q: ExecutionQuery = serde_json::from_str(r#"{"limit": 5}"#).unwrap();
+        assert_eq!(q.limit, Some(5));
+        assert_eq!(q.offset, 0);
+        assert!(q.task_id.is_none());
+    }
 
     #[test]
     fn kind_is_inferred_from_extension() {

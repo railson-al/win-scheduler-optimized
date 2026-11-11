@@ -163,6 +163,30 @@ Depois de 1.5 e 1.6, a 1.8 (Haiku) roda enquanto escrevo a 1.9. Nunca dois execu
   x86_64-pc-windows-gnu` passa a valer para a toolchain fixada. Quem já tinha o target na toolchain `stable`
   precisa adicioná-lo de novo.
 
+## Leva 1: estado e pendências da revisão
+
+Implementada: crate `ipc` (protocolo, codec, transporte, cliente), servidor em `service/src/ipc_server.rs`,
+`daemon` com IPC e CLI como cliente. Verificado no Linux: testes, clippy, 20 rodadas de estresse e o aceite
+manual (sem daemon, segundo daemon, `kill -9` no meio de uma execução). **Não verificado no Windows:** o
+pipe só foi checado por tipo (`cargo check --target x86_64-pc-windows-gnu`, e só para `core` e `ipc`).
+
+Corrigido a partir da revisão (`rust-reviewer`): receptores de eventos que nunca terminavam com o daemon
+morto; `Lagged` tratado como "terminou" na CLI (agora `Event::Resync` e consulta da execução); cliente que
+para de ler segurando uma vaga (timeout de escrita e envios cancelaveis); corrida entre dois daemons na
+remoção do socket obsoleto (agora `flock`); `ErrorCode::TooLarge`; log apagado lê como vazio.
+
+Pendente, para decidir (nenhum é regressão da Leva 0):
+
+| # | Pendência | Observação |
+|---|---|---|
+| P1 | `ExportLog` acima de ~8 MiB sempre falha com `TooLarge`; `scriptrunner logs` não imprime esses logs | Precisa de paginação por bytes em `ReadLog` (`next_skip`, `eof`). `ReadLog` também relê o arquivo desde o início a cada página |
+| P2 | Um `Request`, `Event` ou `ErrorCode` desconhecido derruba a conexão; versão exata no handshake | Decidir antes da GUI: faixa de versões, `Unsupported` por requisição, `#[serde(other)]` |
+| P3 | O servidor atende uma requisição por vez por conexão, mas `protocol.rs` diz que a ordem pode variar | Uma `ExportLog` lenta bloqueia `Stop`. Ou paraleliza com limite, ou documenta resposta em ordem |
+| P4 | Pipe do Windows: nome fixo pode ser criado antes por outro processo; o cliente não verifica o servidor; ACL padrão pode barrar o usuário interativo | Leva 2, junto com a conta do serviço (ACL, `GetNamedPipeServerProcessId`) |
+| P5 | Windows: `Fatal` e `Busy` dependem de o `CloseHandle` descarregar dados; `accept` é recriado a cada rodada do `select!` | Confirmar em máquina real e adicionar teste `cfg(windows)` |
+| P6 | Sem timeout de ociosidade depois do handshake; `reject_busy` sem limite de tarefas; `usize` no fio (`ReadLog`, `Stopped`) | Baixo risco, trocar por `u32` ou `u64` antes de a GUI depender |
+| P7 | Caminho do socket Unix acima de ~108 bytes falha no `bind` | Só afeta desenvolvimento em Linux com `SCRIPTRUNNER_DATA_DIR` longo; a mensagem de erro hoje não explica |
+
 ## Pesquisa concluída
 
 - **Toolchain, `fmt` e CI (verificado):**

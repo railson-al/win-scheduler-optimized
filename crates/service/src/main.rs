@@ -1,20 +1,23 @@
-//! Development front end for the engine. It stands in for the Windows
-//! service + GUI until those exist: `daemon` runs the scheduler, the other
-//! commands manage tasks and inspect history.
-//!
-//! Commands other than `daemon`/`run` edit the database directly; a running
-//! daemon notices within 30 seconds (the real service gets IPC in phase 2).
+//! Development front end for the engine. `daemon` runs the scheduler and owns
+//! the database. Every other command is a client of that running daemon: it
+//! talks to it over local IPC (a named pipe on Windows, a Unix socket
+//! elsewhere) and never opens the database itself, so start the daemon first.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Local, NaiveTime, Utc, Weekday};
 use clap::{Args, Parser, Subcommand};
 use scriptrunner_core::logs::LogKind;
-use scriptrunner_core::{Execution, ExecutionStatus, Schedule, ScriptKind, Task};
-use scriptrunner_service::engine::{Engine, Event};
-use scriptrunner_storage::{ExecutionQuery, Storage};
+use scriptrunner_core::{Execution, ExecutionId, ExecutionQuery, ExecutionStatus, Schedule, ScriptKind, Task};
+use scriptrunner_ipc::Event;
+use scriptrunner_ipc::client::{Client, ClientError};
+use scriptrunner_ipc::transport::{Endpoint, Listener};
+use scriptrunner_service::engine::Engine;
+use scriptrunner_service::ipc_server;
+use scriptrunner_storage::Storage;
+use tokio::sync::broadcast::error::RecvError;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
@@ -149,9 +152,20 @@ fn build_schedule(args: &AddArgs) -> Result<Option<Schedule>> {
     Ok(args.cron.clone().map(|expr| Schedule::Cron { expr }))
 }
 
+/// Connects to the daemon that owns `dir`.
+async fn connect(dir: &Path) -> Result<Client> {
+    match Client::connect(&Endpoint::for_data_dir(dir)).await {
+        Ok(client) => Ok(client),
+        Err(ClientError::NotRunning(_)) => {
+            bail!("the ScriptRunner daemon is not running; start it with `scriptrunner daemon`")
+        }
+        Err(err) => Err(err).context("connecting to the ScriptRunner daemon"),
+    }
+}
+
 /// Resolves a task by exact name, full id or unique id prefix.
-fn find_task(engine: &Engine, key: &str) -> Result<Task> {
-    let tasks = engine.list_tasks()?;
+async fn find_task(client: &Client, key: &str) -> Result<Task> {
+    let tasks = client.list_tasks().await?;
     if let Some(task) = tasks.iter().find(|t| t.name == key || t.id.as_str() == key) {
         return Ok(task.clone());
     }
@@ -160,6 +174,47 @@ fn find_task(engine: &Engine, key: &str) -> Result<Task> {
         [one] => Ok((*one).clone()),
         [] => bail!("no task named or numbered {key:?}"),
         _ => bail!("{key:?} matches several tasks; use more of the id"),
+    }
+}
+
+/// Resolves an execution by full id, or by a unique id prefix among the most
+/// recent executions.
+async fn resolve_execution(client: &Client, key: &str) -> Result<ExecutionId> {
+    let full = ExecutionId::from(key.to_owned());
+    if client.get_execution(&full).await?.is_some() {
+        return Ok(full);
+    }
+    let recent = client
+        .executions(ExecutionQuery {
+            limit: Some(1000),
+            ..Default::default()
+        })
+        .await?;
+    let matches: Vec<_> = recent.iter().filter(|e| e.id.as_str().starts_with(key)).collect();
+    match matches.as_slice() {
+        [one] => Ok(one.id.clone()),
+        [] => bail!("no execution starting with {key:?}"),
+        _ => bail!("{key:?} matches several executions; use more of the id"),
+    }
+}
+
+/// Prints the log lines after the first `shown` ones and returns the new count.
+/// The server caps each page, so this reads until a page comes back empty.
+async fn print_new_log_lines(client: &Client, id: &ExecutionId, mut shown: usize) -> Result<usize> {
+    loop {
+        let page = client.read_log(id, shown, usize::MAX).await?;
+        if page.is_empty() {
+            return Ok(shown);
+        }
+        for entry in &page {
+            let tag = match entry.kind {
+                LogKind::Stdout => "out",
+                LogKind::Stderr => "err",
+                LogKind::Meta => "---",
+            };
+            println!("[{tag}] {}", entry.text);
+            shown += 1;
+        }
     }
 }
 
@@ -188,34 +243,9 @@ fn print_execution(e: &Execution) {
     );
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        .init();
-
-    let cli = Cli::parse();
-    let dir = data_dir(&cli);
-    let storage = Storage::open(&dir.join("scriptrunner.db"))
-        .with_context(|| format!("opening database in {}", dir.display()))?;
-    let engine = Engine::new(storage, dir.clone())?;
-
-    match cli.command {
-        Command::Daemon => {
-            engine.startup()?;
-            tracing::info!(data_dir = %dir.display(), "scheduler started");
-            let shutdown = CancellationToken::new();
-            let scheduler = tokio::spawn({
-                let engine = engine.clone();
-                let shutdown = shutdown.clone();
-                async move { engine.run_scheduler(shutdown).await }
-            });
-            tokio::signal::ctrl_c().await?;
-            tracing::info!("shutting down");
-            shutdown.cancel();
-            scheduler.await?;
-            engine.shutdown().await;
-        }
+async fn run_client_command(client: &Client, command: Command) -> Result<()> {
+    match command {
+        Command::Daemon => bail!("the daemon is started by main, not run as a client command"),
         Command::Add(args) => {
             let mut task = Task::new(&args.name, &args.script);
             if ScriptKind::from_path(&args.script).is_none() {
@@ -230,11 +260,11 @@ async fn main() -> Result<()> {
             task.timeout_secs = args.timeout;
             task.allow_concurrent = args.concurrent;
             task.schedule = build_schedule(&args)?;
-            let task = engine.create_task(task)?;
+            let task = client.create_task(task).await?;
             println!("created {} ({})", task.name, &task.id.as_str()[..8]);
         }
         Command::List => {
-            for row in engine.overview()? {
+            for row in client.overview().await? {
                 let state = match (row.running, row.task.schedule.is_some(), row.task.schedule_enabled) {
                     (true, _, _) => "running",
                     (_, false, _) => "manual",
@@ -254,67 +284,110 @@ async fn main() -> Result<()> {
             }
         }
         Command::Run { task } => {
-            let task = find_task(&engine, &task)?;
-            let mut events = engine.subscribe();
-            let id = engine.run_now(&task.id)?;
+            let task = find_task(client, &task).await?;
+            // Subscribe before starting the run so its first events cannot be missed.
+            let mut events = client.subscribe().await?;
+            let id = client.run_now(&task.id).await?;
             let mut shown = 0;
             loop {
                 let finished = match events.recv().await {
                     Ok(Event::ExecutionChanged(e)) if e.id == id => e.status.is_terminal(),
-                    Ok(_) => false,
-                    Err(_) => true,
+                    Ok(Event::ExecutionChanged(_) | Event::TasksChanged) => false,
+                    // Events were lost (this client or the daemon fell behind): ask the
+                    // daemon about the execution itself instead of trusting the stream.
+                    Ok(Event::Resync) | Err(RecvError::Lagged(_)) => client
+                        .get_execution(&id)
+                        .await?
+                        .is_some_and(|execution| execution.status.is_terminal()),
+                    Err(RecvError::Closed) => bail!("lost the connection to the daemon while the run was in progress"),
                 };
-                for entry in engine.read_log(&id, shown, usize::MAX)? {
-                    let tag = match entry.kind {
-                        LogKind::Stdout => "out",
-                        LogKind::Stderr => "err",
-                        LogKind::Meta => "---",
-                    };
-                    println!("[{tag}] {}", entry.text);
-                    shown += 1;
-                }
+                shown = print_new_log_lines(client, &id, shown).await?;
                 if finished {
                     break;
                 }
             }
-            let execution = engine.get_execution(&id)?.context("execution vanished")?;
+            let execution = client.get_execution(&id).await?.context("execution vanished")?;
             print_execution(&execution);
             if execution.status != ExecutionStatus::Success {
                 std::process::exit(1);
             }
         }
         Command::Disable { task } => {
-            let task = engine.set_schedule_enabled(&find_task(&engine, &task)?.id, false)?;
+            let task = find_task(client, &task).await?;
+            let task = client.set_schedule_enabled(&task.id, false).await?;
             println!("paused {}", task.name);
         }
         Command::Enable { task } => {
-            let task = engine.set_schedule_enabled(&find_task(&engine, &task)?.id, true)?;
+            let task = find_task(client, &task).await?;
+            let task = client.set_schedule_enabled(&task.id, true).await?;
             println!("resumed {}", task.name);
         }
         Command::Delete { task } => {
-            let task = find_task(&engine, &task)?;
-            engine.delete_task(&task.id)?;
+            let task = find_task(client, &task).await?;
+            client.delete_task(&task.id).await?;
             println!("deleted {}", task.name);
         }
         Command::History { task, limit } => {
-            let task_id = task.map(|key| find_task(&engine, &key)).transpose()?.map(|t| t.id);
-            for execution in engine.executions(&ExecutionQuery {
-                task_id,
-                limit: Some(limit),
-                ..Default::default()
-            })? {
+            let task_id = match task {
+                Some(key) => Some(find_task(client, &key).await?.id),
+                None => None,
+            };
+            for execution in client
+                .executions(ExecutionQuery {
+                    task_id,
+                    limit: Some(limit),
+                    ..Default::default()
+                })
+                .await?
+            {
                 print_execution(&execution);
             }
         }
         Command::Logs { execution } => {
-            let all = engine.executions(&ExecutionQuery {
-                limit: Some(10_000),
-                ..Default::default()
-            })?;
-            let Some(found) = all.iter().find(|e| e.id.as_str().starts_with(&execution)) else {
-                bail!("no execution starting with {execution:?}");
-            };
-            print!("{}", engine.export_log(&found.id)?);
+            let id = resolve_execution(client, &execution).await?;
+            print!("{}", client.export_log(&id).await?);
+        }
+    }
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .init();
+
+    let cli = Cli::parse();
+    let dir = data_dir(&cli);
+
+    match cli.command {
+        Command::Daemon => {
+            let storage = Storage::open(&dir.join("scriptrunner.db"))
+                .with_context(|| format!("opening database in {}", dir.display()))?;
+            let engine = Engine::new(storage, dir.clone())?;
+            // Claim the endpoint first. A second daemon must fail here, *before*
+            // `startup()` marks the first one's running executions as interrupted.
+            let endpoint = Endpoint::for_data_dir(&dir);
+            let listener = Listener::bind(&endpoint).await.context("starting the ipc server")?;
+            engine.startup()?;
+            tracing::info!(data_dir = %dir.display(), endpoint = %endpoint.address().display(), "daemon started");
+            let shutdown = CancellationToken::new();
+            let scheduler = tokio::spawn({
+                let engine = engine.clone();
+                let shutdown = shutdown.clone();
+                async move { engine.run_scheduler(shutdown).await }
+            });
+            let server = tokio::spawn(ipc_server::serve(engine.clone(), listener, shutdown.clone()));
+            tokio::signal::ctrl_c().await?;
+            tracing::info!("shutting down");
+            shutdown.cancel();
+            scheduler.await?;
+            server.await?;
+            engine.shutdown().await;
+        }
+        command => {
+            let client = connect(&dir).await?;
+            run_client_command(&client, command).await?;
         }
     }
     Ok(())
