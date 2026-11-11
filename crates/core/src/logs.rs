@@ -71,7 +71,12 @@ impl LogWriter {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        Ok(Self { out: BufWriter::new(File::create(path)?), bytes: 0, max_bytes, truncated: false })
+        Ok(Self {
+            out: BufWriter::new(File::create(path)?),
+            bytes: 0,
+            max_bytes,
+            truncated: false,
+        })
     }
 
     pub fn write_line(&mut self, line: &LogLine) -> io::Result<()> {
@@ -81,7 +86,8 @@ impl LogWriter {
             if !self.truncated {
                 self.truncated = true;
                 let note = format!("[log truncated: {} byte limit reached]", self.max_bytes);
-                self.out.write_all(encode(Utc::now(), LogKind::Meta, &note).as_bytes())?;
+                self.out
+                    .write_all(encode(Utc::now(), LogKind::Meta, &note).as_bytes())?;
             }
             return Ok(());
         }
@@ -117,7 +123,11 @@ fn decode(line: &str) -> Option<LogEntry> {
     let millis: i64 = parts.next()?.parse().ok()?;
     let kind = LogKind::from_code(parts.next()?)?;
     let text = parts.next()?.to_owned();
-    Some(LogEntry { at: Utc.timestamp_millis_opt(millis).single()?, kind, text })
+    Some(LogEntry {
+        at: Utc.timestamp_millis_opt(millis).single()?,
+        kind,
+        text,
+    })
 }
 
 /// Reads up to `limit` entries, skipping the first `skip`. Polling with
@@ -165,7 +175,11 @@ mod tests {
     use super::*;
 
     fn line(stream: LogStream, text: &str) -> LogLine {
-        LogLine { at: Utc::now(), stream, text: text.to_owned() }
+        LogLine {
+            at: Utc::now(),
+            stream,
+            text: text.to_owned(),
+        }
     }
 
     #[test]
@@ -209,7 +223,9 @@ mod tests {
         let path = dir.path().join("a.log");
         let mut writer = LogWriter::create(&path, 80).unwrap();
         for i in 0..20 {
-            writer.write_line(&line(LogStream::Stdout, &format!("line number {i}"))).unwrap();
+            writer
+                .write_line(&line(LogStream::Stdout, &format!("line number {i}")))
+                .unwrap();
         }
         writer.write_meta("finished").unwrap();
         writer.flush().unwrap();
@@ -217,7 +233,11 @@ mod tests {
         assert!(writer.truncated());
         assert!(writer.bytes_written() <= 80);
         let entries = read_log(&path, 0, 1000).unwrap();
-        let notes: Vec<_> = entries.iter().filter(|e| e.kind == LogKind::Meta).map(|e| e.text.as_str()).collect();
+        let notes: Vec<_> = entries
+            .iter()
+            .filter(|e| e.kind == LogKind::Meta)
+            .map(|e| e.text.as_str())
+            .collect();
         assert_eq!(notes.len(), 2);
         assert!(notes[0].contains("truncated"));
         assert_eq!(notes[1], "finished");

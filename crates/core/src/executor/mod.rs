@@ -83,7 +83,12 @@ pub fn plan_command(task: &Task, settings: &Settings) -> CommandPlan {
             .map(Path::to_path_buf)
     });
 
-    CommandPlan { program, args, env, cwd }
+    CommandPlan {
+        program,
+        args,
+        env,
+        cwd,
+    }
 }
 
 fn default_python() -> &'static str {
@@ -113,15 +118,17 @@ pub struct RunOutcome {
 
 impl RunOutcome {
     fn new(status: ExecutionStatus, exit_code: Option<i32>, reason: impl Into<Option<String>>) -> Self {
-        Self { status, exit_code, failure_reason: reason.into() }
+        Self {
+            status,
+            exit_code,
+            failure_reason: reason.into(),
+        }
     }
 
     fn from_exit(status: ExitStatus) -> Self {
         match status.code() {
             Some(0) => Self::new(ExecutionStatus::Success, Some(0), None),
-            Some(code) => {
-                Self::new(ExecutionStatus::Failed, Some(code), format!("exited with code {code}"))
-            }
+            Some(code) => Self::new(ExecutionStatus::Failed, Some(code), format!("exited with code {code}")),
             None => Self::new(ExecutionStatus::Failed, None, describe_abnormal_exit(status)),
         }
     }
@@ -178,7 +185,12 @@ pub fn spawn(plan: &CommandPlan, logs: Option<mpsc::Sender<LogLine>>) -> io::Res
     if let Some(stderr) = child.stderr.take() {
         readers.push(tokio::spawn(pump(stderr, LogStream::Stderr, logs)));
     }
-    Ok(RunningProcess { child, tree, readers, pid })
+    Ok(RunningProcess {
+        child,
+        tree,
+        readers,
+        pid,
+    })
 }
 
 impl RunningProcess {
@@ -260,7 +272,11 @@ where
         }
         // Keep reading (to keep the script unblocked) even if the consumer is gone.
         if let Some(tx) = &sink {
-            let line = LogLine { at: Utc::now(), stream, text: decode_output(trim_eol(&buf)) };
+            let line = LogLine {
+                at: Utc::now(),
+                stream,
+                text: decode_output(trim_eol(&buf)),
+            };
             if tx.send(line).await.is_err() {
                 sink = None;
             }
@@ -334,9 +350,18 @@ mod plan_tests {
     #[test]
     fn python_falls_back_to_settings_then_default() {
         let task = Task::new("t", "job.py");
-        let settings = Settings { default_python: Some("C:\\py\\python.exe".into()), ..Settings::default() };
-        assert_eq!(plan_command(&task, &settings).program, OsString::from("C:\\py\\python.exe"));
-        assert_eq!(plan_command(&task, &Settings::default()).program, OsString::from(default_python()));
+        let settings = Settings {
+            default_python: Some("C:\\py\\python.exe".into()),
+            ..Settings::default()
+        };
+        assert_eq!(
+            plan_command(&task, &settings).program,
+            OsString::from("C:\\py\\python.exe")
+        );
+        assert_eq!(
+            plan_command(&task, &Settings::default()).program,
+            OsString::from(default_python())
+        );
     }
 
     #[test]
@@ -357,16 +382,29 @@ mod plan_tests {
         assert_eq!(plan.program, OsString::from("powershell.exe"));
         assert_eq!(
             plan.args,
-            os(&["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", "report.ps1"])
+            os(&[
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                "report.ps1"
+            ])
         );
     }
 
     #[test]
     fn working_dir_defaults_to_script_directory() {
         let mut task = Task::new("t", "/opt/jobs/a.py");
-        assert_eq!(plan_command(&task, &Settings::default()).cwd, Some(PathBuf::from("/opt/jobs")));
+        assert_eq!(
+            plan_command(&task, &Settings::default()).cwd,
+            Some(PathBuf::from("/opt/jobs"))
+        );
         task.working_dir = Some(PathBuf::from("/data"));
-        assert_eq!(plan_command(&task, &Settings::default()).cwd, Some(PathBuf::from("/data")));
+        assert_eq!(
+            plan_command(&task, &Settings::default()).cwd,
+            Some(PathBuf::from("/data"))
+        );
         assert_eq!(plan_command(&Task::new("t", "a.py"), &Settings::default()).cwd, None);
     }
 
@@ -393,7 +431,11 @@ mod process_tests {
         }
     }
 
-    async fn run(plan: CommandPlan, timeout: Option<Duration>, cancel: &CancellationToken) -> (RunOutcome, Vec<LogLine>) {
+    async fn run(
+        plan: CommandPlan,
+        timeout: Option<Duration>,
+        cancel: &CancellationToken,
+    ) -> (RunOutcome, Vec<LogLine>) {
         let (tx, mut rx) = mpsc::channel(64);
         let process = spawn(&plan, Some(tx)).expect("spawn");
         let outcome = process.wait(timeout, cancel).await;
@@ -423,7 +465,12 @@ mod process_tests {
 
     #[tokio::test]
     async fn spawn_failure_is_reported() {
-        let plan = CommandPlan { program: "/definitely/not/here".into(), args: vec![], env: vec![], cwd: None };
+        let plan = CommandPlan {
+            program: "/definitely/not/here".into(),
+            args: vec![],
+            env: vec![],
+            cwd: None,
+        };
         assert!(spawn(&plan, None).is_err());
     }
 
@@ -484,7 +531,9 @@ mod process_tests {
         assert!(lines.iter().all(|l| l.text.len() <= MAX_LINE_BYTES as usize));
 
         let process = spawn(&sh(script), None).unwrap();
-        let outcome = process.wait(Some(Duration::from_secs(10)), &CancellationToken::new()).await;
+        let outcome = process
+            .wait(Some(Duration::from_secs(10)), &CancellationToken::new())
+            .await;
         assert_eq!(outcome.status, ExecutionStatus::Success);
     }
 

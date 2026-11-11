@@ -26,7 +26,9 @@ mod imp {
 
     impl ProcessTree {
         pub fn attach(child: &Child) -> Self {
-            Self { pgid: child.id().and_then(|pid| i32::try_from(pid).ok()) }
+            Self {
+                pgid: child.id().and_then(|pid| i32::try_from(pid).ok()),
+            }
         }
 
         pub fn kill(&self) {
@@ -44,9 +46,7 @@ mod imp {
 #[cfg(windows)]
 mod imp {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, TerminateJobObject,
-    };
+    use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW, TerminateJobObject};
 
     use super::*;
 

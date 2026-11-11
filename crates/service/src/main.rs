@@ -91,7 +91,9 @@ fn data_dir(cli: &Cli) -> PathBuf {
         return dir.clone();
     }
     if cfg!(windows) {
-        let base = std::env::var_os("PROGRAMDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("C:\\ProgramData"));
+        let base = std::env::var_os("PROGRAMDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("C:\\ProgramData"));
         return base.join("ScriptRunner");
     }
     let base = std::env::var_os("XDG_DATA_HOME")
@@ -113,7 +115,8 @@ fn parse_every(text: &str) -> Result<u64> {
         'h' => 3600,
         _ => bail!(usage()),
     };
-    n.checked_mul(seconds_per_unit).with_context(|| format!("interval {text:?} is too large"))
+    n.checked_mul(seconds_per_unit)
+        .with_context(|| format!("interval {text:?} is too large"))
 }
 
 fn parse_time(text: &str) -> Result<NaiveTime> {
@@ -122,10 +125,15 @@ fn parse_time(text: &str) -> Result<NaiveTime> {
 
 fn build_schedule(args: &AddArgs) -> Result<Option<Schedule>> {
     if let Some(every) = &args.every {
-        return Ok(Some(Schedule::Interval { every_secs: parse_every(every)?, anchor: Utc::now() }));
+        return Ok(Some(Schedule::Interval {
+            every_secs: parse_every(every)?,
+            anchor: Utc::now(),
+        }));
     }
     if let Some(time) = &args.daily {
-        return Ok(Some(Schedule::Daily { time: parse_time(time)? }));
+        return Ok(Some(Schedule::Daily {
+            time: parse_time(time)?,
+        }));
     }
     if let Some(spec) = &args.weekly {
         let (days, time) = spec.split_once(' ').context("use `--weekly \"mon,fri 09:30\"`")?;
@@ -133,7 +141,10 @@ fn build_schedule(args: &AddArgs) -> Result<Option<Schedule>> {
             .split(',')
             .map(|d| Weekday::from_str(d.trim()).map_err(|_| anyhow::anyhow!("unknown weekday {d:?}")))
             .collect::<Result<Vec<_>>>()?;
-        return Ok(Some(Schedule::Weekly { days, time: parse_time(time.trim())? }));
+        return Ok(Some(Schedule::Weekly {
+            days,
+            time: parse_time(time.trim())?,
+        }));
     }
     Ok(args.cron.clone().map(|expr| Schedule::Cron { expr }))
 }
@@ -157,7 +168,10 @@ fn local(at: DateTime<Utc>) -> String {
 }
 
 fn print_execution(e: &Execution) {
-    let took = e.duration().map_or_else(|| "-".to_owned(), |d| format!("{:.1}s", d.num_milliseconds() as f64 / 1000.0));
+    let took = e.duration().map_or_else(
+        || "-".to_owned(),
+        |d| format!("{:.1}s", d.num_milliseconds() as f64 / 1000.0),
+    );
     println!(
         "{}  {:<11} {:<9} {:<20} exit={:<4} {:>7}  {}{}",
         &e.id.as_str()[..8],
@@ -167,7 +181,10 @@ fn print_execution(e: &Execution) {
         e.exit_code.map_or_else(|| "-".to_owned(), |c| c.to_string()),
         took,
         local(e.created_at),
-        e.failure_reason.as_deref().map(|r| format!("  ({r})")).unwrap_or_default(),
+        e.failure_reason
+            .as_deref()
+            .map(|r| format!("  ({r})"))
+            .unwrap_or_default(),
     );
 }
 
@@ -179,7 +196,8 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let dir = data_dir(&cli);
-    let storage = Storage::open(&dir.join("scriptrunner.db")).with_context(|| format!("opening database in {}", dir.display()))?;
+    let storage = Storage::open(&dir.join("scriptrunner.db"))
+        .with_context(|| format!("opening database in {}", dir.display()))?;
     let engine = Engine::new(storage, dir.clone())?;
 
     match cli.command {
@@ -201,7 +219,10 @@ async fn main() -> Result<()> {
         Command::Add(args) => {
             let mut task = Task::new(&args.name, &args.script);
             if ScriptKind::from_path(&args.script).is_none() {
-                tracing::warn!("unknown extension; treating {} as a directly executable file", args.script.display());
+                tracing::warn!(
+                    "unknown extension; treating {} as a directly executable file",
+                    args.script.display()
+                );
             }
             task.args = args.args.clone();
             task.interpreter = args.interpreter.clone();
@@ -225,7 +246,9 @@ async fn main() -> Result<()> {
                     &row.task.id.as_str()[..8],
                     row.task.name,
                     state,
-                    row.last_execution.as_ref().map_or("-".to_owned(), |e| e.status.to_string()),
+                    row.last_execution
+                        .as_ref()
+                        .map_or("-".to_owned(), |e| e.status.to_string()),
                     row.next_run.map_or("-".to_owned(), local),
                 );
             }
@@ -275,12 +298,19 @@ async fn main() -> Result<()> {
         }
         Command::History { task, limit } => {
             let task_id = task.map(|key| find_task(&engine, &key)).transpose()?.map(|t| t.id);
-            for execution in engine.executions(&ExecutionQuery { task_id, limit: Some(limit), ..Default::default() })? {
+            for execution in engine.executions(&ExecutionQuery {
+                task_id,
+                limit: Some(limit),
+                ..Default::default()
+            })? {
                 print_execution(&execution);
             }
         }
         Command::Logs { execution } => {
-            let all = engine.executions(&ExecutionQuery { limit: Some(10_000), ..Default::default() })?;
+            let all = engine.executions(&ExecutionQuery {
+                limit: Some(10_000),
+                ..Default::default()
+            })?;
             let Some(found) = all.iter().find(|e| e.id.as_str().starts_with(&execution)) else {
                 bail!("no execution starting with {execution:?}");
             };

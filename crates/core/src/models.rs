@@ -329,7 +329,10 @@ mod tests {
 
     #[test]
     fn kind_is_inferred_from_extension() {
-        assert_eq!(ScriptKind::from_path(Path::new("C:\\x\\Backup.PY")), Some(ScriptKind::Python));
+        assert_eq!(
+            ScriptKind::from_path(Path::new("C:\\x\\Backup.PY")),
+            Some(ScriptKind::Python)
+        );
         assert_eq!(ScriptKind::from_path(Path::new("a.bat")), Some(ScriptKind::Bat));
         assert_eq!(ScriptKind::from_path(Path::new("a.cmd")), Some(ScriptKind::Cmd));
         assert_eq!(ScriptKind::from_path(Path::new("a.ps1")), Some(ScriptKind::PowerShell));

@@ -11,8 +11,7 @@ use std::sync::{Mutex, MutexGuard};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, Row, ToSql, params};
 use scriptrunner_core::{
-    CoreError, Execution, ExecutionId, ExecutionStatus, Schedule, ScriptKind, Settings, Task, TaskId,
-    Trigger,
+    CoreError, Execution, ExecutionId, ExecutionStatus, Schedule, ScriptKind, Settings, Task, TaskId, Trigger,
 };
 use thiserror::Error;
 
@@ -239,7 +238,11 @@ impl Storage {
     pub fn next_run_of(&self, id: &TaskId) -> Result<Option<DateTime<Utc>>> {
         let conn = self.db();
         let text: Option<Option<String>> = conn
-            .query_row("SELECT next_run_at FROM schedules WHERE task_id = ?1", [id.as_str()], |r| r.get(0))
+            .query_row(
+                "SELECT next_run_at FROM schedules WHERE task_id = ?1",
+                [id.as_str()],
+                |r| r.get(0),
+            )
             .optional()?;
         text.flatten().map(|t| parse_ts(&t)).transpose()
     }
@@ -254,7 +257,10 @@ impl Storage {
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         rows.map(|row| {
             let (id, at) = row?;
-            Ok(ScheduledSlot { task_id: TaskId::from(id), next_run_at: parse_ts(&at)? })
+            Ok(ScheduledSlot {
+                task_id: TaskId::from(id),
+                next_run_at: parse_ts(&at)?,
+            })
         })
         .collect()
     }
@@ -325,9 +331,13 @@ impl Storage {
 
     pub fn get_execution(&self, id: &ExecutionId) -> Result<Option<Execution>> {
         let conn = self.db();
-        conn.query_row(&format!("{EXEC_SELECT} WHERE id = ?1"), [id.as_str()], execution_from_row)
-            .optional()?
-            .transpose()
+        conn.query_row(
+            &format!("{EXEC_SELECT} WHERE id = ?1"),
+            [id.as_str()],
+            execution_from_row,
+        )
+        .optional()?
+        .transpose()
     }
 
     /// Newest first.
@@ -375,12 +385,18 @@ impl Storage {
 
     /// Deletes the history of one task; returns the log files to remove from disk.
     pub fn clear_task_history(&self, id: &TaskId) -> Result<Vec<String>> {
-        self.delete_executions("task_id = ?1 AND status NOT IN ('queued','running')", params![id.as_str()])
+        self.delete_executions(
+            "task_id = ?1 AND status NOT IN ('queued','running')",
+            params![id.as_str()],
+        )
     }
 
     /// Retention (RN11): deletes finished executions created before `cutoff`.
     pub fn prune_history_before(&self, cutoff: DateTime<Utc>) -> Result<Vec<String>> {
-        self.delete_executions("created_at < ?1 AND status NOT IN ('queued','running')", params![ts(cutoff)])
+        self.delete_executions(
+            "created_at < ?1 AND status NOT IN ('queued','running')",
+            params![ts(cutoff)],
+        )
     }
 
     /// Deletes the matching rows and returns their log files, atomically.
@@ -388,8 +404,9 @@ impl Storage {
         let mut conn = self.db();
         let tx = conn.transaction()?;
         let files = {
-            let mut stmt = tx
-                .prepare(&format!("SELECT log_file FROM executions WHERE {filter} AND log_file IS NOT NULL"))?;
+            let mut stmt = tx.prepare(&format!(
+                "SELECT log_file FROM executions WHERE {filter} AND log_file IS NOT NULL"
+            ))?;
             let rows = stmt.query_map(params, |r| r.get::<_, String>(0))?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
@@ -424,13 +441,18 @@ impl Storage {
              ORDER BY created_at ASC",
         )?;
         let candidates = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))?
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         for (id, file, bytes) in candidates {
             if total <= max_total_bytes {
                 break;
             }
-            conn.execute("UPDATE executions SET log_file = NULL, log_bytes = 0 WHERE id = ?1", [&id])?;
+            conn.execute(
+                "UPDATE executions SET log_file = NULL, log_bytes = 0 WHERE id = ?1",
+                [&id],
+            )?;
             total = total.saturating_sub(bytes.max(0) as u64);
             removed.push(file);
         }
@@ -666,7 +688,9 @@ mod tests {
         assert_eq!(db.get_task(&task.id).unwrap().unwrap().schedule, None);
 
         task.name = "Renamed".into();
-        task.schedule = Some(Schedule::Daily { time: chrono::NaiveTime::from_hms_opt(8, 0, 0).unwrap() });
+        task.schedule = Some(Schedule::Daily {
+            time: chrono::NaiveTime::from_hms_opt(8, 0, 0).unwrap(),
+        });
         db.update_task(&task, Some(at(8, 0))).unwrap();
         let loaded = db.get_task(&task.id).unwrap().unwrap();
         assert_eq!(loaded.name, "Renamed");
@@ -688,11 +712,17 @@ mod tests {
         let names: Vec<_> = db.list_tasks().unwrap().into_iter().map(|t| t.name).collect();
         assert_eq!(names, ["Alpha", "beta"]);
 
-        db.insert_execution(&finished(&a, ExecutionStatus::Success, at(2, 0), None)).unwrap();
+        db.insert_execution(&finished(&a, ExecutionStatus::Success, at(2, 0), None))
+            .unwrap();
         assert!(db.delete_task(&a.id).unwrap());
         assert!(db.get_task(&a.id).unwrap().is_none());
         assert!(db.list_scheduled().unwrap().iter().all(|s| s.task_id != a.id));
-        let history = db.list_executions(&ExecutionQuery { task_id: Some(a.id.clone()), ..Default::default() }).unwrap();
+        let history = db
+            .list_executions(&ExecutionQuery {
+                task_id: Some(a.id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].task_name, "Alpha");
     }
@@ -704,12 +734,18 @@ mod tests {
         db.insert_task(&task, Some(at(0, 10))).unwrap();
 
         let first = Execution::new(&task, Trigger::Scheduled, Some(at(0, 10)));
-        assert!(db.claim_scheduled_run(&task.id, at(0, 10), Some(at(0, 20)), &first).unwrap());
+        assert!(
+            db.claim_scheduled_run(&task.id, at(0, 10), Some(at(0, 20)), &first)
+                .unwrap()
+        );
         assert_eq!(db.next_run_of(&task.id).unwrap(), Some(at(0, 20)));
 
         // Same slot again (e.g. a restart racing the old process): refused, nothing written.
         let dup = Execution::new(&task, Trigger::Scheduled, Some(at(0, 10)));
-        assert!(!db.claim_scheduled_run(&task.id, at(0, 10), Some(at(0, 20)), &dup).unwrap());
+        assert!(
+            !db.claim_scheduled_run(&task.id, at(0, 10), Some(at(0, 20)), &dup)
+                .unwrap()
+        );
         assert!(db.get_execution(&dup.id).unwrap().is_none());
         assert_eq!(db.list_executions(&ExecutionQuery::default()).unwrap().len(), 1);
     }
@@ -730,18 +766,41 @@ mod tests {
         let db = Storage::open_in_memory().unwrap();
         let t1 = scheduled_task("one");
         let t2 = scheduled_task("two");
-        for (i, status) in [ExecutionStatus::Success, ExecutionStatus::Failed, ExecutionStatus::Success].into_iter().enumerate() {
-            db.insert_execution(&finished(&t1, status, at(1, i as u32), None)).unwrap();
+        for (i, status) in [
+            ExecutionStatus::Success,
+            ExecutionStatus::Failed,
+            ExecutionStatus::Success,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            db.insert_execution(&finished(&t1, status, at(1, i as u32), None))
+                .unwrap();
         }
-        db.insert_execution(&finished(&t2, ExecutionStatus::Failed, at(1, 30), None)).unwrap();
+        db.insert_execution(&finished(&t2, ExecutionStatus::Failed, at(1, 30), None))
+            .unwrap();
 
-        let by_task = ExecutionQuery { task_id: Some(t1.id.clone()), ..Default::default() };
+        let by_task = ExecutionQuery {
+            task_id: Some(t1.id.clone()),
+            ..Default::default()
+        };
         assert_eq!(db.list_executions(&by_task).unwrap().len(), 3);
-        let failed = ExecutionQuery { status: Some(ExecutionStatus::Failed), ..Default::default() };
+        let failed = ExecutionQuery {
+            status: Some(ExecutionStatus::Failed),
+            ..Default::default()
+        };
         assert_eq!(db.list_executions(&failed).unwrap().len(), 2);
-        let window = ExecutionQuery { since: Some(at(1, 1)), until: Some(at(1, 30)), ..Default::default() };
+        let window = ExecutionQuery {
+            since: Some(at(1, 1)),
+            until: Some(at(1, 30)),
+            ..Default::default()
+        };
         assert_eq!(db.list_executions(&window).unwrap().len(), 2); // 1:01 and 1:02
-        let page = ExecutionQuery { limit: Some(2), offset: 1, ..Default::default() };
+        let page = ExecutionQuery {
+            limit: Some(2),
+            offset: 1,
+            ..Default::default()
+        };
         let rows = db.list_executions(&page).unwrap();
         assert_eq!(rows.len(), 2);
         assert!(rows[0].created_at >= rows[1].created_at); // newest first
@@ -762,7 +821,10 @@ mod tests {
         assert_eq!(r.status, ExecutionStatus::Interrupted);
         assert_eq!(r.finished_at, Some(at(2, 0)));
         assert!(r.failure_reason.unwrap().contains("service stopped"));
-        assert_eq!(db.get_execution(&done.id).unwrap().unwrap().status, ExecutionStatus::Success);
+        assert_eq!(
+            db.get_execution(&done.id).unwrap().unwrap().status,
+            ExecutionStatus::Success
+        );
     }
 
     #[test]
@@ -778,7 +840,10 @@ mod tests {
         assert_eq!(db.prune_history_before(at(3, 0)).unwrap(), ["old.log"]);
         assert!(db.get_execution(&old.id).unwrap().is_none());
         assert!(db.get_execution(&recent.id).unwrap().is_some());
-        assert!(db.get_execution(&in_flight.id).unwrap().is_some(), "running executions are never pruned");
+        assert!(
+            db.get_execution(&in_flight.id).unwrap().is_some(),
+            "running executions are never pruned"
+        );
 
         assert_eq!(db.clear_task_history(&task.id).unwrap(), ["recent.log"]);
         assert_eq!(db.list_executions(&ExecutionQuery::default()).unwrap().len(), 1);
@@ -806,10 +871,20 @@ mod tests {
     fn settings_default_then_persist() {
         let db = Storage::open_in_memory().unwrap();
         assert_eq!(db.load_settings().unwrap(), Settings::default());
-        let custom = Settings { max_concurrent_executions: 9, history_retention_days: 7, ..Settings::default() };
+        let custom = Settings {
+            max_concurrent_executions: 9,
+            history_retention_days: 7,
+            ..Settings::default()
+        };
         db.save_settings(&custom).unwrap();
         assert_eq!(db.load_settings().unwrap(), custom);
-        assert!(db.save_settings(&Settings { max_concurrent_executions: 0, ..Settings::default() }).is_err());
+        assert!(
+            db.save_settings(&Settings {
+                max_concurrent_executions: 0,
+                ..Settings::default()
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -820,7 +895,8 @@ mod tests {
         {
             let db = Storage::open(&path).unwrap();
             db.insert_task(&task, Some(at(0, 10))).unwrap();
-            db.insert_execution(&finished(&task, ExecutionStatus::Success, at(1, 0), None)).unwrap();
+            db.insert_execution(&finished(&task, ExecutionStatus::Success, at(1, 0), None))
+                .unwrap();
         }
         let db = Storage::open(&path).unwrap(); // migrations must be idempotent
         assert_eq!(db.list_tasks().unwrap().len(), 1);

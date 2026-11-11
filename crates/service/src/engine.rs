@@ -6,9 +6,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Local, Utc};
 use scriptrunner_core::executor::{self, LogLine, RunOutcome};
 use scriptrunner_core::logs::{self, LogEntry, LogWriter};
-use scriptrunner_core::{
-    CoreError, Execution, ExecutionId, ExecutionStatus, Settings, Task, TaskId, Trigger,
-};
+use scriptrunner_core::{CoreError, Execution, ExecutionId, ExecutionStatus, Settings, Task, TaskId, Trigger};
 use scriptrunner_storage::{ExecutionQuery, ScheduledSlot, Storage, StorageError};
 use thiserror::Error;
 use tokio::sync::{Notify, Semaphore, SemaphorePermit, broadcast, mpsc};
@@ -136,7 +134,10 @@ impl Engine {
     pub fn startup(&self) -> Result<()> {
         let orphans = self.inner.storage.reconcile_orphaned_executions(Utc::now())?;
         if orphans > 0 {
-            warn!(orphans, "marked executions left over from a previous run as interrupted");
+            warn!(
+                orphans,
+                "marked executions left over from a previous run as interrupted"
+            );
         }
         self.housekeeping()
     }
@@ -195,7 +196,11 @@ impl Engine {
             let last_execution = self
                 .inner
                 .storage
-                .list_executions(&ExecutionQuery { task_id: Some(task.id.clone()), limit: Some(1), ..Default::default() })?
+                .list_executions(&ExecutionQuery {
+                    task_id: Some(task.id.clone()),
+                    limit: Some(1),
+                    ..Default::default()
+                })?
                 .into_iter()
                 .next();
             rows.push(TaskOverview {
@@ -261,12 +266,16 @@ impl Engine {
 
     /// Reads a page of log entries (works while the run is still going).
     pub fn read_log(&self, id: &ExecutionId, skip: usize, limit: usize) -> Result<Vec<LogEntry>> {
-        let Some(file) = self.log_file_of(id)? else { return Ok(Vec::new()) };
+        let Some(file) = self.log_file_of(id)? else {
+            return Ok(Vec::new());
+        };
         Ok(logs::read_log(&self.inner.logs_dir.join(file), skip, limit)?)
     }
 
     pub fn export_log(&self, id: &ExecutionId) -> Result<String> {
-        let Some(file) = self.log_file_of(id)? else { return Ok(String::new()) };
+        let Some(file) = self.log_file_of(id)? else {
+            return Ok(String::new());
+        };
         Ok(logs::export_text(&self.inner.logs_dir.join(file))?)
     }
 
@@ -359,14 +368,19 @@ impl Engine {
 
         let (execution, reserved) = if missed {
             let mut skipped = Execution::new(&task, Trigger::Scheduled, Some(slot.next_run_at));
-            finish_as_skipped(&mut skipped, "missed: the service or computer was not running at the scheduled time");
+            finish_as_skipped(
+                &mut skipped,
+                "missed: the service or computer was not running at the scheduled time",
+            );
             (skipped, false)
         } else {
             self.prepare(&task, Trigger::Scheduled, Some(slot.next_run_at))
         };
 
-        let claimed =
-            self.inner.storage.claim_scheduled_run(&task.id, slot.next_run_at, new_next, &execution)?;
+        let claimed = self
+            .inner
+            .storage
+            .claim_scheduled_run(&task.id, slot.next_run_at, new_next, &execution)?;
         if !claimed {
             if reserved {
                 self.active().remove(&execution.id);
@@ -391,10 +405,19 @@ impl Engine {
         let mut execution = Execution::new(task, trigger, scheduled_for);
         let mut active = self.active();
         if !task.allow_concurrent && active.values().any(|run| run.task_id == task.id) {
-            finish_as_skipped(&mut execution, "skipped: the previous run of this task is still in progress");
+            finish_as_skipped(
+                &mut execution,
+                "skipped: the previous run of this task is still in progress",
+            );
             return (execution, false);
         }
-        active.insert(execution.id.clone(), ActiveRun { task_id: task.id.clone(), cancel: CancellationToken::new() });
+        active.insert(
+            execution.id.clone(),
+            ActiveRun {
+                task_id: task.id.clone(),
+                cancel: CancellationToken::new(),
+            },
+        );
         (execution, true)
     }
 
@@ -414,7 +437,10 @@ impl Engine {
             permit = self.inner.slots.acquire() => permit.ok(),
             _ = cancel.cancelled() => None,
         };
-        let Some(_slot) = permit.map(|permit| SlotPermit { inner: &self.inner, permit: Some(permit) }) else {
+        let Some(_slot) = permit.map(|permit| SlotPermit {
+            inner: &self.inner,
+            permit: Some(permit),
+        }) else {
             execution.status = ExecutionStatus::Interrupted;
             execution.failure_reason = Some("stopped while waiting for a free execution slot".into());
             execution.finished_at = Some(Utc::now());
@@ -434,7 +460,11 @@ impl Engine {
             match LogWriter::create(&self.inner.logs_dir.join(&file), settings.max_log_bytes_per_execution) {
                 Ok(mut w) => {
                     let args: Vec<_> = plan.args.iter().map(|a| a.to_string_lossy()).collect();
-                    let _ = w.write_meta(&format!("started: {} {}", plan.program.to_string_lossy(), args.join(" ")));
+                    let _ = w.write_meta(&format!(
+                        "started: {} {}",
+                        plan.program.to_string_lossy(),
+                        args.join(" ")
+                    ));
                     execution.log_file = Some(file);
                     writer = Some(w);
                 }
@@ -465,7 +495,10 @@ impl Engine {
             None => (None, None),
         };
 
-        let timeout = task.timeout_secs.or(settings.default_timeout_secs).map(Duration::from_secs);
+        let timeout = task
+            .timeout_secs
+            .or(settings.default_timeout_secs)
+            .map(Duration::from_secs);
         let outcome = match executor::spawn(&plan, sink) {
             Ok(process) => process.wait(timeout, &cancel).await,
             Err(err) => RunOutcome {
@@ -482,12 +515,18 @@ impl Engine {
         if let Some(handle) = consumer
             && let Ok(mut w) = handle.await
         {
-            let seconds = execution.duration().map_or(0.0, |d| d.num_milliseconds() as f64 / 1000.0);
+            let seconds = execution
+                .duration()
+                .map_or(0.0, |d| d.num_milliseconds() as f64 / 1000.0);
             let _ = w.write_meta(&format!(
                 "finished: {} (exit code {}, {seconds:.1}s){}",
                 execution.status,
                 execution.exit_code.map_or_else(|| "n/a".to_owned(), |c| c.to_string()),
-                execution.failure_reason.as_deref().map(|r| format!(" - {r}")).unwrap_or_default(),
+                execution
+                    .failure_reason
+                    .as_deref()
+                    .map(|r| format!(" - {r}"))
+                    .unwrap_or_default(),
             ));
             let _ = w.flush();
             execution.log_bytes = w.bytes_written();
@@ -633,7 +672,12 @@ mod tests {
 
     async fn finished(engine: &Engine, id: &ExecutionId) -> Execution {
         wait_until(
-            || engine.get_execution(id).unwrap().is_some_and(|e| e.status.is_terminal()),
+            || {
+                engine
+                    .get_execution(id)
+                    .unwrap()
+                    .is_some_and(|e| e.status.is_terminal())
+            },
             "execution to finish",
         )
         .await;
@@ -643,7 +687,10 @@ mod tests {
     #[tokio::test]
     async fn manual_run_records_history_and_logs() {
         let fx = fixture();
-        let task = fx.engine.create_task(fx.script("ok.sh", "echo hello; echo oops >&2")).unwrap();
+        let task = fx
+            .engine
+            .create_task(fx.script("ok.sh", "echo hello; echo oops >&2"))
+            .unwrap();
         let id = fx.engine.run_now(&task.id).unwrap();
         let exec = finished(&fx.engine, &id).await;
 
@@ -668,7 +715,10 @@ mod tests {
         assert_eq!(exec.status, ExecutionStatus::Failed);
         assert_eq!(exec.exit_code, Some(7));
 
-        let ghost = fx.engine.create_task(Task::new("ghost", fx.dir.path().join("missing.sh"))).unwrap();
+        let ghost = fx
+            .engine
+            .create_task(Task::new("ghost", fx.dir.path().join("missing.sh")))
+            .unwrap();
         let exec = finished(&fx.engine, &fx.engine.run_now(&ghost.id).unwrap()).await;
         assert_eq!(exec.status, ExecutionStatus::Failed);
         assert!(exec.failure_reason.unwrap().contains("failed to start"));
@@ -679,12 +729,28 @@ mod tests {
         let fx = fixture();
         let task = fx.engine.create_task(fx.script("slow.sh", "sleep 30")).unwrap();
         let first = fx.engine.run_now(&task.id).unwrap();
-        wait_until(|| fx.engine.get_execution(&first).unwrap().unwrap().status == ExecutionStatus::Running, "running").await;
+        wait_until(
+            || fx.engine.get_execution(&first).unwrap().unwrap().status == ExecutionStatus::Running,
+            "running",
+        )
+        .await;
 
-        assert!(matches!(fx.engine.run_now(&task.id), Err(EngineError::AlreadyRunning(_))));
-        let history = fx.engine.executions(&ExecutionQuery { task_id: Some(task.id.clone()), ..Default::default() }).unwrap();
+        assert!(matches!(
+            fx.engine.run_now(&task.id),
+            Err(EngineError::AlreadyRunning(_))
+        ));
+        let history = fx
+            .engine
+            .executions(&ExecutionQuery {
+                task_id: Some(task.id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
         assert_eq!(history.len(), 2);
-        assert_eq!(history.iter().filter(|e| e.status == ExecutionStatus::Skipped).count(), 1);
+        assert_eq!(
+            history.iter().filter(|e| e.status == ExecutionStatus::Skipped).count(),
+            1
+        );
 
         assert_eq!(fx.engine.stop(&task.id), 1);
         let exec = finished(&fx.engine, &first).await;
@@ -721,15 +787,27 @@ mod tests {
     #[tokio::test]
     async fn global_concurrency_limit_queues_extra_runs() {
         let fx = fixture();
-        fx.engine.update_settings(Settings { max_concurrent_executions: 1, ..Settings::default() }).unwrap();
+        fx.engine
+            .update_settings(Settings {
+                max_concurrent_executions: 1,
+                ..Settings::default()
+            })
+            .unwrap();
         let a = fx.engine.create_task(fx.script("a.sh", "sleep 30")).unwrap();
         let b = fx.engine.create_task(fx.script("b.sh", "echo b")).unwrap();
         let first = fx.engine.run_now(&a.id).unwrap();
-        wait_until(|| fx.engine.get_execution(&first).unwrap().unwrap().status == ExecutionStatus::Running, "a running").await;
+        wait_until(
+            || fx.engine.get_execution(&first).unwrap().unwrap().status == ExecutionStatus::Running,
+            "a running",
+        )
+        .await;
 
         let second = fx.engine.run_now(&b.id).unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(fx.engine.get_execution(&second).unwrap().unwrap().status, ExecutionStatus::Queued);
+        assert_eq!(
+            fx.engine.get_execution(&second).unwrap().unwrap().status,
+            ExecutionStatus::Queued
+        );
 
         fx.engine.stop(&a.id);
         assert_eq!(finished(&fx.engine, &second).await.status, ExecutionStatus::Success);
@@ -738,19 +816,33 @@ mod tests {
     #[tokio::test]
     async fn lowering_the_limit_while_slots_are_busy_still_takes_effect() {
         let fx = fixture();
-        fx.engine.update_settings(Settings { max_concurrent_executions: 2, ..Settings::default() }).unwrap();
+        fx.engine
+            .update_settings(Settings {
+                max_concurrent_executions: 2,
+                ..Settings::default()
+            })
+            .unwrap();
         let a = fx.engine.create_task(fx.script("a.sh", "sleep 30")).unwrap();
         let b = fx.engine.create_task(fx.script("b.sh", "sleep 30")).unwrap();
         let ra = fx.engine.run_now(&a.id).unwrap();
         let rb = fx.engine.run_now(&b.id).unwrap();
         wait_until(
-            || [&ra, &rb].iter().all(|id| fx.engine.get_execution(id).unwrap().unwrap().status == ExecutionStatus::Running),
+            || {
+                [&ra, &rb]
+                    .iter()
+                    .all(|id| fx.engine.get_execution(id).unwrap().unwrap().status == ExecutionStatus::Running)
+            },
             "both running",
         )
         .await;
 
         // Every permit is in use, so none can be forgotten immediately.
-        fx.engine.update_settings(Settings { max_concurrent_executions: 1, ..Settings::default() }).unwrap();
+        fx.engine
+            .update_settings(Settings {
+                max_concurrent_executions: 1,
+                ..Settings::default()
+            })
+            .unwrap();
         fx.engine.stop(&a.id);
         fx.engine.stop(&b.id);
         finished(&fx.engine, &ra).await;
@@ -760,10 +852,17 @@ mod tests {
         let c = fx.engine.create_task(fx.script("c.sh", "sleep 30")).unwrap();
         let d = fx.engine.create_task(fx.script("d.sh", "echo d")).unwrap();
         let rc = fx.engine.run_now(&c.id).unwrap();
-        wait_until(|| fx.engine.get_execution(&rc).unwrap().unwrap().status == ExecutionStatus::Running, "c running").await;
+        wait_until(
+            || fx.engine.get_execution(&rc).unwrap().unwrap().status == ExecutionStatus::Running,
+            "c running",
+        )
+        .await;
         let rd = fx.engine.run_now(&d.id).unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(fx.engine.get_execution(&rd).unwrap().unwrap().status, ExecutionStatus::Queued);
+        assert_eq!(
+            fx.engine.get_execution(&rd).unwrap().unwrap().status,
+            ExecutionStatus::Queued
+        );
 
         fx.engine.stop(&c.id);
         assert_eq!(finished(&fx.engine, &rd).await.status, ExecutionStatus::Success);
@@ -773,7 +872,10 @@ mod tests {
     async fn scheduler_fires_interval_tasks_without_duplicates() {
         let fx = fixture();
         let mut task = fx.script("tick.sh", "echo tick");
-        task.schedule = Some(Schedule::Interval { every_secs: 1, anchor: Utc::now() });
+        task.schedule = Some(Schedule::Interval {
+            every_secs: 1,
+            anchor: Utc::now(),
+        });
         let task = fx.engine.create_task(task).unwrap();
 
         let (shutdown, scheduler) = fx.start_scheduler();
@@ -782,7 +884,13 @@ mod tests {
         scheduler.await.unwrap();
         fx.engine.shutdown().await;
 
-        let runs = fx.engine.executions(&ExecutionQuery { task_id: Some(task.id.clone()), ..Default::default() }).unwrap();
+        let runs = fx
+            .engine
+            .executions(&ExecutionQuery {
+                task_id: Some(task.id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
         assert!((2..=4).contains(&runs.len()), "expected ~3 runs, got {}", runs.len());
         assert!(runs.iter().all(|r| r.trigger == Trigger::Scheduled));
         let mut slots: Vec<_> = runs.iter().map(|r| r.scheduled_for.unwrap()).collect();
@@ -795,19 +903,31 @@ mod tests {
     async fn disabled_schedules_do_not_fire_but_manual_runs_work() {
         let fx = fixture();
         let mut task = fx.script("tick.sh", "echo tick");
-        task.schedule = Some(Schedule::Interval { every_secs: 1, anchor: Utc::now() });
+        task.schedule = Some(Schedule::Interval {
+            every_secs: 1,
+            anchor: Utc::now(),
+        });
         task.schedule_enabled = false;
         let task = fx.engine.create_task(task).unwrap();
 
         let (shutdown, scheduler) = fx.start_scheduler();
         tokio::time::sleep(Duration::from_millis(2200)).await;
         assert!(fx.engine.executions(&ExecutionQuery::default()).unwrap().is_empty());
-        assert_eq!(finished(&fx.engine, &fx.engine.run_now(&task.id).unwrap()).await.status, ExecutionStatus::Success);
+        assert_eq!(
+            finished(&fx.engine, &fx.engine.run_now(&task.id).unwrap()).await.status,
+            ExecutionStatus::Success
+        );
 
         // Enabling at runtime takes effect without restarting the scheduler.
         fx.engine.set_schedule_enabled(&task.id, true).unwrap();
         wait_until(
-            || fx.engine.executions(&ExecutionQuery::default()).unwrap().iter().any(|e| e.trigger == Trigger::Scheduled),
+            || {
+                fx.engine
+                    .executions(&ExecutionQuery::default())
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.trigger == Trigger::Scheduled)
+            },
             "a scheduled run after enabling",
         )
         .await;
@@ -824,7 +944,8 @@ mod tests {
         let task = fx.engine.create_task(task).unwrap();
         // Pretend the computer was off: the stored slot is 3 hours old.
         // (Truncated to ms: that is the precision the database keeps.)
-        let stale = DateTime::from_timestamp_millis((Utc::now() - ChronoDuration::hours(3)).timestamp_millis()).unwrap();
+        let stale =
+            DateTime::from_timestamp_millis((Utc::now() - ChronoDuration::hours(3)).timestamp_millis()).unwrap();
         fx.engine.inner.storage.set_next_run(&task.id, Some(stale)).unwrap();
 
         let (shutdown, scheduler) = fx.start_scheduler();
