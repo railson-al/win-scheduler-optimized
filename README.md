@@ -144,7 +144,7 @@ Checklist manual do serviço (só dá para confirmar no Windows):
 - O runner é administrador, então esse job não detecta erro de permissão para usuário comum. Por isso existe o
   item 3 do checklist manual (terminal sem elevação).
 - A toolchain é fixada em `rust-toolchain.toml` (Rust 1.99.1); o mínimo suportado é 1.88, por causa da edition 2024 e de let-chains.
-- Os planos de desenvolvimento estão em `docs/PLANO-LEVA-0-1.md` (levas 0 e 1) e `docs/PLANO-LEVA-2.md` (serviço do Windows).
+- Os planos de desenvolvimento estão em `docs/PLANO-LEVA-0-1.md` (levas 0 e 1) `docs/PLANO-LEVA-2.md` (serviço do Windows) e `docs/PLANO-LEVA-3.md` (interface gráfica, ainda por fazer).
 
 ## Desenvolvimento no Linux
 

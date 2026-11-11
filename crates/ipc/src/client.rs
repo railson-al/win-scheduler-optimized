@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use scriptrunner_core::logs::LogEntry;
+use scriptrunner_core::logs::{LogChunk, LogEntry, format_entry};
 use scriptrunner_core::{Execution, ExecutionId, ExecutionQuery, Settings, Task, TaskId, TaskOverview};
 use thiserror::Error;
 use tokio::io::{ReadHalf, WriteHalf};
@@ -22,12 +22,17 @@ use tokio::time::timeout;
 
 use crate::codec::{CodecError, FrameReader, FrameWriter, frame_reader, frame_writer, read_frame, write_frame};
 use crate::protocol::{
-    ClientFrame, ErrorBody, Event, Outcome, PROTOCOL_VERSION, Request, Response, ServerFrame, StatusInfo,
+    ClientFrame, ErrorBody, ErrorCode, Event, MIN_PROTOCOL_VERSION, Outcome, PROTOCOL_VERSION, Request, Response,
+    ServerFrame, StatusInfo,
 };
 use crate::transport::{Endpoint, Stream, TransportError, connect};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const EVENT_BUFFER: usize = 1024;
+/// Bytes of log asked for per `ReadLogFrom` call. The daemon caps it too.
+pub const LOG_CHUNK_BYTES: u32 = 1024 * 1024;
+/// First protocol with `ReadLogFrom`.
+const LOG_FROM_SINCE: u32 = 2;
 
 #[derive(Debug, Error)]
 pub enum ClientError {
@@ -88,6 +93,8 @@ impl Shared {
 }
 
 struct Inner {
+    /// What the handshake settled on; older than ours when the daemon is older.
+    protocol_version: u32,
     shared: Arc<Shared>,
     writer: tokio::sync::Mutex<FrameWriter<WriteHalf<Stream>>>,
     next_id: AtomicU64,
@@ -121,16 +128,20 @@ impl Client {
             },
         )
         .await?;
-        match timeout(HANDSHAKE_TIMEOUT, read_frame::<_, ServerFrame>(&mut reader)).await {
+        let negotiated = match timeout(HANDSHAKE_TIMEOUT, read_frame::<_, ServerFrame>(&mut reader)).await {
             Err(_) => {
                 return Err(ClientError::Unexpected(
                     "the daemon did not answer the handshake".into(),
                 ));
             }
-            Ok(Ok(Some(ServerFrame::Hello { protocol_version }))) if protocol_version == PROTOCOL_VERSION => {}
+            Ok(Ok(Some(ServerFrame::Hello { protocol_version })))
+                if (MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&protocol_version) =>
+            {
+                protocol_version
+            }
             Ok(Ok(Some(ServerFrame::Hello { protocol_version }))) => {
                 return Err(ClientError::Unexpected(format!(
-                    "the daemon speaks protocol {protocol_version}, this client speaks {PROTOCOL_VERSION}"
+                    "the daemon speaks protocol {protocol_version}, this client speaks {MIN_PROTOCOL_VERSION} to {PROTOCOL_VERSION}"
                 )));
             }
             Ok(Ok(Some(ServerFrame::Fatal { error }))) => return Err(ClientError::Remote(error)),
@@ -141,7 +152,7 @@ impl Client {
             }
             Ok(Ok(None)) => return Err(ClientError::Disconnected),
             Ok(Err(err)) => return Err(err.into()),
-        }
+        };
 
         let (events, _) = broadcast::channel(EVENT_BUFFER);
         let shared = Arc::new(Shared {
@@ -152,12 +163,18 @@ impl Client {
         let reader_task = tokio::spawn(read_loop(reader, Arc::clone(&shared)));
         Ok(Self {
             inner: Arc::new(Inner {
+                protocol_version: negotiated,
                 shared,
                 writer: tokio::sync::Mutex::new(writer),
                 next_id: AtomicU64::new(1),
                 reader_task,
             }),
         })
+    }
+
+    /// The protocol this connection speaks: ours, or an older one if the daemon is older.
+    pub fn protocol_version(&self) -> u32 {
+        self.inner.protocol_version
     }
 
     /// Sends one request and waits for its response. A daemon-side error comes
@@ -276,7 +293,7 @@ impl Client {
     }
 
     /// How many running or queued executions were cancelled.
-    pub async fn stop(&self, id: &TaskId) -> Result<usize> {
+    pub async fn stop(&self, id: &TaskId) -> Result<u32> {
         match self.call(Request::Stop { id: id.clone() }).await? {
             Response::Stopped(count) => Ok(count),
             other => Err(unexpected(&other)),
@@ -301,7 +318,7 @@ impl Client {
         self.done_call(Request::ClearHistory { id: id.clone() }).await
     }
 
-    pub async fn read_log(&self, id: &ExecutionId, skip: usize, limit: usize) -> Result<Vec<LogEntry>> {
+    pub async fn read_log(&self, id: &ExecutionId, skip: u32, limit: u32) -> Result<Vec<LogEntry>> {
         match self
             .call(Request::ReadLog {
                 id: id.clone(),
@@ -315,10 +332,50 @@ impl Client {
         }
     }
 
-    pub async fn export_log(&self, id: &ExecutionId) -> Result<String> {
-        match self.call(Request::ExportLog { id: id.clone() }).await? {
-            Response::LogText(text) => Ok(text),
+    /// One page of the log from byte `offset` (0, or the `next_offset` of the previous
+    /// page). Poll it to follow a running execution: it costs the same on every call.
+    /// Needs a daemon that speaks protocol 2.
+    pub async fn read_log_from(&self, id: &ExecutionId, offset: u64, max_bytes: u32) -> Result<LogChunk> {
+        if self.inner.protocol_version < LOG_FROM_SINCE {
+            return Err(ClientError::Remote(ErrorBody::new(
+                ErrorCode::Unsupported,
+                "the daemon is older than this client and cannot read logs by position; update it",
+            )));
+        }
+        match self
+            .call(Request::ReadLogFrom {
+                id: id.clone(),
+                offset,
+                max_bytes,
+            })
+            .await?
+        {
+            Response::LogChunk(chunk) => Ok(chunk),
             other => Err(unexpected(&other)),
+        }
+    }
+
+    /// The whole log as text, however large: it is fetched page by page, so it is no longer
+    /// limited by the size of one frame. (It does build the whole text in memory.)
+    pub async fn export_log(&self, id: &ExecutionId) -> Result<String> {
+        if self.inner.protocol_version < LOG_FROM_SINCE {
+            return match self.call(Request::ExportLog { id: id.clone() }).await? {
+                Response::LogText(text) => Ok(text),
+                other => Err(unexpected(&other)),
+            };
+        }
+        let mut text = String::new();
+        let mut offset = 0;
+        loop {
+            let chunk = self.read_log_from(id, offset, LOG_CHUNK_BYTES).await?;
+            text.extend(chunk.entries.iter().map(format_entry));
+            if chunk.eof {
+                return Ok(text);
+            }
+            if chunk.next_offset <= offset {
+                return Err(ClientError::Unexpected("the daemon's log read made no progress".into()));
+            }
+            offset = chunk.next_offset;
         }
     }
 

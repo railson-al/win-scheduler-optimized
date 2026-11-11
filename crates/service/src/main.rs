@@ -12,7 +12,7 @@ use clap::{Args, Parser, Subcommand};
 use scriptrunner_core::logs::LogKind;
 use scriptrunner_core::{Execution, ExecutionId, ExecutionQuery, ExecutionStatus, Schedule, ScriptKind, Task};
 use scriptrunner_ipc::Event;
-use scriptrunner_ipc::client::{Client, ClientError};
+use scriptrunner_ipc::client::{Client, ClientError, LOG_CHUNK_BYTES};
 use scriptrunner_ipc::transport::Endpoint;
 use scriptrunner_service::{daemon, logging};
 use tokio::sync::broadcast::error::RecvError;
@@ -223,22 +223,22 @@ async fn resolve_execution(client: &Client, key: &str) -> Result<ExecutionId> {
     }
 }
 
-/// Prints the log lines after the first `shown` ones and returns the new count.
-/// The server caps each page, so this reads until a page comes back empty.
-async fn print_new_log_lines(client: &Client, id: &ExecutionId, mut shown: usize) -> Result<usize> {
+/// Prints the log lines from byte `offset` on and returns where to continue.
+/// The daemon caps each page, so this reads until it reports the end of the file.
+async fn print_new_log_lines(client: &Client, id: &ExecutionId, mut offset: u64) -> Result<u64> {
     loop {
-        let page = client.read_log(id, shown, usize::MAX).await?;
-        if page.is_empty() {
-            return Ok(shown);
-        }
-        for entry in &page {
+        let chunk = client.read_log_from(id, offset, LOG_CHUNK_BYTES).await?;
+        for entry in &chunk.entries {
             let tag = match entry.kind {
                 LogKind::Stdout => "out",
                 LogKind::Stderr => "err",
                 LogKind::Meta => "---",
             };
             println!("[{tag}] {}", entry.text);
-            shown += 1;
+        }
+        offset = chunk.next_offset;
+        if chunk.eof {
+            return Ok(offset);
         }
     }
 }
@@ -313,11 +313,11 @@ async fn run_client_command(client: &Client, command: Command) -> Result<()> {
             // Subscribe before starting the run so its first events cannot be missed.
             let mut events = client.subscribe().await?;
             let id = client.run_now(&task.id).await?;
-            let mut shown = 0;
+            let mut offset = 0;
             loop {
                 let finished = match events.recv().await {
                     Ok(Event::ExecutionChanged(e)) if e.id == id => e.status.is_terminal(),
-                    Ok(Event::ExecutionChanged(_) | Event::TasksChanged) => false,
+                    Ok(Event::ExecutionChanged(_) | Event::TasksChanged | Event::Unknown) => false,
                     // Events were lost (this client or the daemon fell behind): ask the
                     // daemon about the execution itself instead of trusting the stream.
                     Ok(Event::Resync) | Err(RecvError::Lagged(_)) => client
@@ -326,7 +326,7 @@ async fn run_client_command(client: &Client, command: Command) -> Result<()> {
                         .is_some_and(|execution| execution.status.is_terminal()),
                     Err(RecvError::Closed) => bail!("lost the connection to the daemon while the run was in progress"),
                 };
-                shown = print_new_log_lines(client, &id, shown).await?;
+                offset = print_new_log_lines(client, &id, offset).await?;
                 if finished {
                     break;
                 }

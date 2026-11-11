@@ -19,8 +19,8 @@ use scriptrunner_ipc::codec::{
 };
 use scriptrunner_ipc::transport::{Listener, Stream};
 use scriptrunner_ipc::{
-    ClientFrame, ErrorBody, ErrorCode, Event as WireEvent, Outcome, PROTOCOL_VERSION, Request, Response, ServerFrame,
-    StatusInfo,
+    ClientFrame, ErrorBody, ErrorCode, Event as WireEvent, MIN_PROTOCOL_VERSION, Outcome, PROTOCOL_VERSION, Request,
+    Response, ServerFrame, StatusInfo,
 };
 use scriptrunner_storage::StorageError;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -47,6 +47,9 @@ const OUTBOX_CAPACITY: usize = 256;
 /// pages comfortably below that. Clients page with `offset` / `skip`.
 const MAX_QUERY_ROWS: u32 = 5_000;
 const MAX_LOG_LINES: usize = 20_000;
+/// Bytes of a log file per `ReadLogFrom`. A short log line grows about 4x as JSON
+/// (timestamp and field names), so this stays well below one frame.
+const MAX_LOG_CHUNK_BYTES: u64 = 1024 * 1024;
 
 /// Serves clients until `shutdown` is cancelled, then waits (bounded) for the
 /// open connections to close.
@@ -146,22 +149,28 @@ async fn run_session<R: AsyncRead + Unpin>(
         _ = broken.cancelled() => return None,
         first = timeout(HANDSHAKE_TIMEOUT, read_frame::<_, ClientFrame>(reader)) => first,
     };
-    match first {
+    // The client names the newest protocol it speaks; the connection uses the lower of the two,
+    // as long as the client is not older than the oldest one this daemon still serves.
+    let negotiated = match first {
         Err(_) => return Some(ErrorBody::new(ErrorCode::Invalid, "handshake timed out")),
-        Ok(Ok(Some(ClientFrame::Hello { protocol_version }))) if protocol_version == PROTOCOL_VERSION => {}
+        Ok(Ok(Some(ClientFrame::Hello { protocol_version }))) if protocol_version >= MIN_PROTOCOL_VERSION => {
+            protocol_version.min(PROTOCOL_VERSION)
+        }
         Ok(Ok(Some(ClientFrame::Hello { protocol_version }))) => {
             return Some(ErrorBody::new(
                 ErrorCode::ProtocolMismatch,
-                format!("the daemon speaks protocol {PROTOCOL_VERSION}, the client sent {protocol_version}"),
+                format!(
+                    "the daemon speaks protocols {MIN_PROTOCOL_VERSION} to {PROTOCOL_VERSION}, the client sent {protocol_version}"
+                ),
             ));
         }
         Ok(Ok(Some(_))) => return Some(ErrorBody::new(ErrorCode::Invalid, "the first frame must be a hello")),
         // The peer left without a word (e.g. the stale-socket probe in `Listener::bind`).
         Ok(Ok(None)) => return None,
         Ok(Err(err)) => return frame_error(err),
-    }
+    };
     let hello = ServerFrame::Hello {
-        protocol_version: PROTOCOL_VERSION,
+        protocol_version: negotiated,
     };
     if !enqueue(outbox, hello, broken).await {
         return None;
@@ -183,6 +192,10 @@ async fn run_session<R: AsyncRead + Unpin>(
                         }
                         Ok(Response::Subscribed)
                     }
+                    Request::Unknown => Err(ErrorBody::new(
+                        ErrorCode::Unsupported,
+                        "this daemon does not understand that request; it may be older than the client",
+                    )),
                     other => dispatch(engine, started, other).await.map_err(|err| error_body(&err)),
                 };
                 let response = ServerFrame::Response {
@@ -324,7 +337,11 @@ async fn dispatch(engine: &Engine, started: Instant, request: Request) -> Result
             Response::Task(engine.blocking(move |e| e.set_schedule_enabled(&id, enabled)).await?)
         }
         Request::RunNow { id } => Response::ExecutionStarted(engine.blocking(move |e| e.run_now(&id)).await?),
-        Request::Stop { id } => Response::Stopped(engine.blocking(move |e| Ok(e.stop(&id))).await?),
+        Request::Stop { id } => Response::Stopped(
+            engine
+                .blocking(move |e| Ok(u32::try_from(e.stop(&id)).unwrap_or(u32::MAX)))
+                .await?,
+        ),
         Request::Executions { mut query } => {
             query.limit = Some(query.limit.map_or(MAX_QUERY_ROWS, |limit| limit.min(MAX_QUERY_ROWS)));
             Response::Executions(engine.blocking(move |e| e.executions(&query)).await?)
@@ -335,8 +352,16 @@ async fn dispatch(engine: &Engine, started: Instant, request: Request) -> Result
             Response::Done
         }
         Request::ReadLog { id, skip, limit } => {
-            let limit = limit.min(MAX_LOG_LINES);
-            Response::LogEntries(engine.blocking(move |e| e.read_log(&id, skip, limit)).await?)
+            let limit = (limit as usize).min(MAX_LOG_LINES);
+            Response::LogEntries(engine.blocking(move |e| e.read_log(&id, skip as usize, limit)).await?)
+        }
+        Request::ReadLogFrom { id, offset, max_bytes } => {
+            let max_bytes = u64::from(max_bytes).min(MAX_LOG_CHUNK_BYTES);
+            Response::LogChunk(
+                engine
+                    .blocking(move |e| e.read_log_from(&id, offset, max_bytes))
+                    .await?,
+            )
         }
         Request::ExportLog { id } => Response::LogText(engine.blocking(move |e| e.export_log(&id)).await?),
         Request::GetSettings => Response::Settings(engine.blocking(|e| e.settings()).await?),
@@ -344,8 +369,8 @@ async fn dispatch(engine: &Engine, started: Instant, request: Request) -> Result
             engine.blocking(move |e| e.update_settings(settings)).await?;
             Response::Done
         }
-        // Handled by the session, which owns the subscription.
-        Request::Subscribe => Response::Subscribed,
+        // Handled by the session, which owns the subscription and answers unknown requests.
+        Request::Subscribe | Request::Unknown => Response::Subscribed,
     })
 }
 

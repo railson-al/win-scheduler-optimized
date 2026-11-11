@@ -1,0 +1,18 @@
+[package]
+name = "scriptrunner-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# eframe 0.37 needs Rust 1.95, newer than the workspace minimum. The toolchain is pinned
+# (rust-toolchain.toml), so this only matters to someone building with an older compiler.
+rust-version = "1.95"
+description = "ScriptRunner graphical front end (egui). Talks to the daemon over IPC; has no SQLite."
+
+[[bin]]
+name = "scriptrunner-gui"
+path = "src/main.rs"
+
+[dependencies]
+# Both renderers are built so a single .exe can be tried either way on a machine without a GPU
+# (see the spike notes in docs/PLANO-LEVA-3.md, task 3.1). The final build keeps only one.
+eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "glow", "wgpu", "wayland", "x11"] }

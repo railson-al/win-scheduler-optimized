@@ -9,9 +9,11 @@ use std::time::Duration;
 use scriptrunner_core::logs::LogKind;
 use scriptrunner_core::{Execution, ExecutionId, ExecutionQuery, ExecutionStatus, Settings, Task};
 use scriptrunner_ipc::client::{Client, ClientError};
-use scriptrunner_ipc::codec::{FrameReader, frame_reader, frame_writer, read_frame, write_frame};
+use scriptrunner_ipc::codec::{FrameReader, FrameWriter, frame_reader, frame_writer, read_frame, write_frame};
 use scriptrunner_ipc::transport::{self, Endpoint, Listener};
-use scriptrunner_ipc::{ClientFrame, ErrorCode, Event, PROTOCOL_VERSION, Request, ServerFrame};
+use scriptrunner_ipc::{
+    ClientFrame, ErrorCode, Event, MIN_PROTOCOL_VERSION, Outcome, PROTOCOL_VERSION, Request, ServerFrame,
+};
 use scriptrunner_service::engine::Engine;
 use scriptrunner_service::ipc_server::{self, MAX_CONNECTIONS};
 use scriptrunner_storage::Storage;
@@ -177,7 +179,7 @@ async fn a_run_streams_events_and_leaves_history_and_logs() {
     let finished = wait_for_terminal(&mut events, &id).await;
     assert_eq!(finished.status, ExecutionStatus::Success);
 
-    let entries = client.read_log(&id, 0, usize::MAX).await.unwrap();
+    let entries = client.read_log(&id, 0, u32::MAX).await.unwrap();
     assert!(entries.iter().any(|e| e.kind == LogKind::Stdout && e.text == "hello"));
     assert!(entries.iter().any(|e| e.kind == LogKind::Stderr && e.text == "oops"));
     assert!(client.export_log(&id).await.unwrap().contains("hello"));
@@ -255,10 +257,8 @@ async fn concurrent_calls_on_one_connection_are_correlated() {
     }
 }
 
-#[tokio::test]
-async fn an_oversized_response_becomes_an_error_and_the_connection_survives() {
-    let daemon = Daemon::start().await;
-    let client = daemon.client().await;
+/// Runs a script that prints ~10 MB, more than one frame can carry once exported in one piece.
+async fn run_big_script(daemon: &Daemon, client: &Client) -> ExecutionId {
     client
         .update_settings(Settings {
             max_log_bytes_per_execution: 64 * 1024 * 1024,
@@ -266,18 +266,79 @@ async fn an_oversized_response_becomes_an_error_and_the_connection_survives() {
         })
         .await
         .unwrap();
-    // ~10 MB of output, more than one frame can carry once exported.
     let task = client
         .create_task(daemon.script("big.sh", "head -c 10000000 /dev/zero | tr '\\0' x; echo"))
         .await
         .unwrap();
-
     let mut events = client.subscribe().await.unwrap();
     let id = client.run_now(&task.id).await.unwrap();
     wait_for_terminal(&mut events, &id).await;
+    id
+}
 
-    assert_eq!(code_of(client.export_log(&id).await.unwrap_err()), ErrorCode::TooLarge);
+#[tokio::test]
+async fn an_oversized_response_becomes_an_error_and_the_connection_survives() {
+    let daemon = Daemon::start().await;
+    let client = daemon.client().await;
+    let id = run_big_script(&daemon, &client).await;
+
+    // The version 1 way of exporting (one frame) still fails cleanly.
+    let whole = client.call(Request::ExportLog { id }).await;
+    assert_eq!(code_of(whole.unwrap_err()), ErrorCode::TooLarge);
     client.status().await.expect("the connection must still work");
+}
+
+#[tokio::test]
+async fn a_log_larger_than_one_frame_exports_in_pages() {
+    let daemon = Daemon::start().await;
+    let client = daemon.client().await;
+    let id = run_big_script(&daemon, &client).await;
+
+    let text = client.export_log(&id).await.unwrap();
+    assert!(text.len() > 10_000_000, "the export lost data: {} bytes", text.len());
+    assert!(text.contains("[---] finished: success"), "the last line must arrive");
+    assert!(
+        text.starts_with(|c: char| c.is_ascii_digit()),
+        "starts with a timestamp"
+    );
+}
+
+#[tokio::test]
+async fn a_running_log_can_be_followed_by_position() {
+    let daemon = Daemon::start().await;
+    let client = daemon.client().await;
+    let task = client
+        .create_task(daemon.script("slow.sh", "echo first; sleep 1; echo second; sleep 30"))
+        .await
+        .unwrap();
+    let id = client.run_now(&task.id).await.unwrap();
+
+    let mut offset = 0;
+    let mut seen = Vec::new();
+    timeout(Duration::from_secs(20), async {
+        while !seen.iter().any(|t| t == "second") {
+            let chunk = client.read_log_from(&id, offset, 4096).await.unwrap();
+            assert!(chunk.next_offset >= offset);
+            offset = chunk.next_offset;
+            seen.extend(chunk.entries.into_iter().map(|e| e.text));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the live lines never arrived");
+    let position = seen.iter().position(|t| t == "first").expect("first line");
+    assert_eq!(seen.iter().filter(|t| *t == "first").count(), 1, "no line is repeated");
+    assert!(position < seen.iter().position(|t| t == "second").unwrap());
+
+    client.stop(&task.id).await.unwrap();
+}
+
+#[tokio::test]
+async fn reading_the_log_of_an_unknown_execution_is_empty_not_an_error() {
+    let daemon = Daemon::start().await;
+    let client = daemon.client().await;
+    let chunk = client.read_log_from(&"nope".into(), 0, 4096).await.unwrap();
+    assert!(chunk.entries.is_empty() && chunk.eof && chunk.next_offset == 0);
 }
 
 #[tokio::test]
@@ -336,19 +397,97 @@ async fn expect_fatal(reader: &mut RawReader, code: ErrorCode) {
 }
 
 #[tokio::test]
-async fn a_wrong_protocol_version_is_refused() {
+async fn a_client_older_than_the_oldest_supported_protocol_is_refused() {
     let daemon = Daemon::start().await;
     let (mut reader, write_half) = raw_connection(&daemon).await;
     let mut writer = frame_writer(write_half);
     write_frame(
         &mut writer,
         &ClientFrame::Hello {
-            protocol_version: PROTOCOL_VERSION + 998,
+            protocol_version: MIN_PROTOCOL_VERSION - 1,
         },
     )
     .await
     .unwrap();
     expect_fatal(&mut reader, ErrorCode::ProtocolMismatch).await;
+}
+
+async fn hello(reader: &mut RawReader, writer: &mut FrameWriter<WriteHalf<transport::Stream>>, version: u32) -> u32 {
+    write_frame(
+        writer,
+        &ClientFrame::Hello {
+            protocol_version: version,
+        },
+    )
+    .await
+    .unwrap();
+    match read_frame::<_, ServerFrame>(reader).await.unwrap() {
+        Some(ServerFrame::Hello { protocol_version }) => protocol_version,
+        other => panic!("expected a hello, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn the_connection_uses_the_lower_of_the_two_protocol_versions() {
+    let daemon = Daemon::start().await;
+
+    // A client from the future is served at what this daemon speaks.
+    let (mut reader, write_half) = raw_connection(&daemon).await;
+    let mut writer = frame_writer(write_half);
+    assert_eq!(
+        hello(&mut reader, &mut writer, PROTOCOL_VERSION + 998).await,
+        PROTOCOL_VERSION
+    );
+
+    // A version 1 client is served at version 1.
+    let (mut reader, write_half) = raw_connection(&daemon).await;
+    let mut writer = frame_writer(write_half);
+    assert_eq!(hello(&mut reader, &mut writer, 1).await, 1);
+}
+
+#[tokio::test]
+async fn an_unknown_request_is_answered_with_unsupported_and_the_connection_survives() {
+    let daemon = Daemon::start().await;
+    let (mut reader, write_half) = raw_connection(&daemon).await;
+    let mut writer = frame_writer(write_half);
+    hello(&mut reader, &mut writer, PROTOCOL_VERSION).await;
+
+    write_frame(
+        &mut writer,
+        &serde_json::json!({"type": "request", "id": 5, "request": {"method": "from_the_future", "params": {"x": 1}}}),
+    )
+    .await
+    .unwrap();
+    match read_frame::<_, ServerFrame>(&mut reader).await.unwrap() {
+        Some(ServerFrame::Response {
+            id: 5,
+            outcome: Outcome::Err { error },
+        }) => assert_eq!(error.code, ErrorCode::Unsupported),
+        other => panic!("expected an unsupported error, got {other:?}"),
+    }
+
+    write_frame(
+        &mut writer,
+        &ClientFrame::Request {
+            id: 6,
+            request: Request::Status,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_frame::<_, ServerFrame>(&mut reader).await.unwrap(),
+        Some(ServerFrame::Response {
+            id: 6,
+            outcome: Outcome::Ok { .. }
+        })
+    ));
+}
+
+#[tokio::test]
+async fn the_client_reports_the_negotiated_version() {
+    let daemon = Daemon::start().await;
+    assert_eq!(daemon.client().await.protocol_version(), PROTOCOL_VERSION);
 }
 
 #[tokio::test]

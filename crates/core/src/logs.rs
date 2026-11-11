@@ -6,7 +6,7 @@
 //! escaping and can be read back incrementally.
 
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use chrono::{DateTime, TimeZone, Utc};
@@ -153,23 +153,81 @@ pub fn read_log(path: &Path, skip: usize, limit: usize) -> io::Result<Vec<LogEnt
     Ok(entries)
 }
 
+/// One page of a log read by byte position; see [`read_log_from`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogChunk {
+    pub entries: Vec<LogEntry>,
+    /// Where the next read starts: the end of the last line consumed.
+    pub next_offset: u64,
+    /// `true` when this read reached the end of what is in the file right now.
+    /// A run that is still going may add more, so keep polling until the
+    /// execution is over *and* a read comes back `eof`.
+    pub eof: bool,
+}
+
+/// Reads whole log lines starting at byte `offset`, until about `max_bytes` of
+/// the file are consumed (always at least one line, so a reader makes progress).
+/// `offset` must be 0 or a `next_offset` returned earlier. A final line that is
+/// still being written (no newline yet) is left for the next read, and
+/// malformed lines are skipped. Unlike [`read_log`] it never rereads the part
+/// already seen, so following a long log costs the same on every poll.
+pub fn read_log_from(path: &Path, offset: u64, max_bytes: u64) -> io::Result<LogChunk> {
+    let mut file = File::open(path)?;
+    if offset >= file.metadata()?.len() {
+        return Ok(LogChunk {
+            entries: Vec::new(),
+            next_offset: offset,
+            eof: true,
+        });
+    }
+    file.seek(SeekFrom::Start(offset))?;
+    let mut reader = BufReader::new(file);
+    let mut entries = Vec::new();
+    let mut next = offset;
+    let mut line = Vec::new();
+    loop {
+        if next > offset && next - offset >= max_bytes {
+            return Ok(LogChunk {
+                entries,
+                next_offset: next,
+                eof: false,
+            });
+        }
+        line.clear();
+        let read = reader.read_until(b'\n', &mut line)?;
+        if read == 0 || line.last() != Some(&b'\n') {
+            break; // end of file, or a line the writer has not finished
+        }
+        next += read as u64;
+        if let Some(entry) = decode(&String::from_utf8_lossy(&line[..read - 1])) {
+            entries.push(entry);
+        }
+    }
+    Ok(LogChunk {
+        entries,
+        next_offset: next,
+        eof: true,
+    })
+}
+
+/// One entry as a line of the plain-text export, newline included.
+pub fn format_entry(entry: &LogEntry) -> String {
+    let tag = match entry.kind {
+        LogKind::Stdout => "OUT",
+        LogKind::Stderr => "ERR",
+        LogKind::Meta => "---",
+    };
+    format!(
+        "{} [{}] {}\n",
+        entry.at.format("%Y-%m-%d %H:%M:%S%.3f"),
+        tag,
+        entry.text
+    )
+}
+
 /// Renders a log as plain text for the "export to .txt" action.
 pub fn export_text(path: &Path) -> io::Result<String> {
-    let mut out = String::new();
-    for entry in read_log(path, 0, usize::MAX)? {
-        let tag = match entry.kind {
-            LogKind::Stdout => "OUT",
-            LogKind::Stderr => "ERR",
-            LogKind::Meta => "---",
-        };
-        out.push_str(&format!(
-            "{} [{}] {}\n",
-            entry.at.format("%Y-%m-%d %H:%M:%S%.3f"),
-            tag,
-            entry.text
-        ));
-    }
-    Ok(out)
+    Ok(read_log(path, 0, usize::MAX)?.iter().map(format_entry).collect())
 }
 
 #[cfg(test)]
@@ -217,6 +275,65 @@ mod tests {
         writer.flush().unwrap();
         let page = read_log(&path, 2, 2).unwrap();
         assert_eq!(page.iter().map(|e| e.text.as_str()).collect::<Vec<_>>(), ["l2", "l3"]);
+    }
+
+    fn texts(chunk: &LogChunk) -> Vec<&str> {
+        chunk.entries.iter().map(|e| e.text.as_str()).collect()
+    }
+
+    #[test]
+    fn reading_by_offset_follows_a_log_without_rereading() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.log");
+        let mut writer = LogWriter::create(&path, 1024).unwrap();
+        for i in 0..5 {
+            writer.write_line(&line(LogStream::Stdout, &format!("l{i}"))).unwrap();
+        }
+        writer.flush().unwrap();
+
+        // A small budget returns a few lines at a time and then stops being `eof`.
+        let first = read_log_from(&path, 0, 1).unwrap();
+        assert_eq!(texts(&first), ["l0"], "at least one line, so a reader always advances");
+        assert!(!first.eof);
+        let rest = read_log_from(&path, first.next_offset, 1 << 20).unwrap();
+        assert_eq!(texts(&rest), ["l1", "l2", "l3", "l4"]);
+        assert!(rest.eof);
+
+        // Caught up: nothing new, same offset. Then the writer adds a line.
+        let idle = read_log_from(&path, rest.next_offset, 1 << 20).unwrap();
+        assert!(idle.entries.is_empty() && idle.eof && idle.next_offset == rest.next_offset);
+        writer.write_line(&line(LogStream::Stderr, "late")).unwrap();
+        writer.flush().unwrap();
+        let more = read_log_from(&path, idle.next_offset, 1 << 20).unwrap();
+        assert_eq!(texts(&more), ["late"]);
+        assert_eq!(more.entries[0].kind, LogKind::Stderr);
+    }
+
+    #[test]
+    fn a_half_written_last_line_waits_for_the_next_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.log");
+        std::fs::write(&path, "1\to\tdone\n2\to\tpart").unwrap();
+
+        let chunk = read_log_from(&path, 0, 1 << 20).unwrap();
+        assert_eq!(texts(&chunk), ["done"]);
+        assert_eq!(chunk.next_offset, "1\to\tdone\n".len() as u64);
+        assert!(chunk.eof);
+
+        std::fs::write(&path, "1\to\tdone\n2\to\tpartial\n").unwrap();
+        let chunk = read_log_from(&path, chunk.next_offset, 1 << 20).unwrap();
+        assert_eq!(texts(&chunk), ["partial"]);
+    }
+
+    #[test]
+    fn reading_past_the_end_or_a_bad_line_is_harmless() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.log");
+        std::fs::write(&path, "garbage\n1\to\tok\n").unwrap();
+        let chunk = read_log_from(&path, 0, 1 << 20).unwrap();
+        assert_eq!(texts(&chunk), ["ok"], "a malformed line is skipped");
+        let beyond = read_log_from(&path, 9_999, 1 << 20).unwrap();
+        assert!(beyond.entries.is_empty() && beyond.eof && beyond.next_offset == 9_999);
     }
 
     #[test]

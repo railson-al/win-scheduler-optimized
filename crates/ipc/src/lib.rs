@@ -13,5 +13,6 @@ mod service_check;
 pub mod transport;
 
 pub use protocol::{
-    ClientFrame, ErrorBody, ErrorCode, Event, Outcome, PROTOCOL_VERSION, Request, Response, ServerFrame, StatusInfo,
+    ClientFrame, ErrorBody, ErrorCode, Event, MIN_PROTOCOL_VERSION, Outcome, PROTOCOL_VERSION, Request, Response,
+    ServerFrame, StatusInfo,
 };

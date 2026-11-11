@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local, Utc};
 use scriptrunner_core::executor::{self, LogLine, RunOutcome};
-use scriptrunner_core::logs::{self, LogEntry, LogWriter};
+use scriptrunner_core::logs::{self, LogChunk, LogEntry, LogWriter};
 use scriptrunner_core::{
     CoreError, Execution, ExecutionId, ExecutionQuery, ExecutionStatus, Settings, Task, TaskId, TaskOverview, Trigger,
 };
@@ -265,6 +265,23 @@ impl Engine {
         // A log file removed behind our back (manual cleanup) reads as empty, not as a failure.
         match logs::read_log(&self.inner.logs_dir.join(file), skip, limit) {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            other => Ok(other?),
+        }
+    }
+
+    /// Reads log lines from byte `offset` (see `logs::read_log_from`). A missing
+    /// execution, or a log file removed behind our back, reads as "nothing yet".
+    pub fn read_log_from(&self, id: &ExecutionId, offset: u64, max_bytes: u64) -> Result<LogChunk> {
+        let empty = LogChunk {
+            entries: Vec::new(),
+            next_offset: offset,
+            eof: true,
+        };
+        let Some(file) = self.log_file_of(id)? else {
+            return Ok(empty);
+        };
+        match logs::read_log_from(&self.inner.logs_dir.join(file), offset, max_bytes) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(empty),
             other => Ok(other?),
         }
     }
