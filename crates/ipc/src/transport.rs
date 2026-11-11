@@ -5,8 +5,9 @@
 //! Security in this phase (see the plan's D4):
 //! * Unix: the socket lives in a directory created with mode 0700, so access is
 //!   restricted from the moment the socket exists (no chmod-after-bind window).
-//! * Windows: the pipe rejects remote clients. A full ACL needs the unsafe
-//!   `create_with_security_attributes_raw` and is left to the service phase.
+//! * Windows: the pipe admits only SYSTEM and Administrators (an explicit DACL on
+//!   every instance, see `pipe_security`) and rejects remote clients. The client
+//!   also checks that the server is the installed service (see `connect`).
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -16,11 +17,20 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum TransportError {
     /// A live daemon already owns the endpoint (so a second one must not start).
-    #[error("another ScriptRunner daemon is already listening on {0}")]
+    #[error("another ScriptRunner daemon is already listening on {0} (or another process holds that name)")]
     AlreadyRunning(String),
     /// Nothing is listening; the daemon is not running.
     #[error("the ScriptRunner daemon is not running (nothing is listening on {0})")]
     NotRunning(String),
+    /// Something owns the endpoint, but it is not the ScriptRunner service.
+    #[error("refusing to talk to the process listening on {0}: it is not the ScriptRunner service")]
+    ServerNotVerified(String),
+    /// The daemon is there but this user may not talk to it.
+    #[error(
+        "access to the ScriptRunner daemon ({0}) was denied; run this command as Administrator \
+         (on Linux, as the user that started the daemon)"
+    )]
+    AccessDenied(String),
     #[error("ipc transport error: {0}")]
     Io(#[from] io::Error),
 }
@@ -185,6 +195,7 @@ mod imp {
                 io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => {
                     TransportError::NotRunning(endpoint.describe())
                 }
+                io::ErrorKind::PermissionDenied => TransportError::AccessDenied(endpoint.describe()),
                 _ => err.into(),
             })
     }
@@ -200,7 +211,14 @@ mod imp {
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
     use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions};
 
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
+
     use super::{Endpoint, TransportError};
+    use crate::pipe_security::PipeSecurity;
+    use crate::service_check::{self, ServiceProcess};
 
     /// `ERROR_PIPE_BUSY`: every server instance is currently serving a client.
     const ERROR_PIPE_BUSY: i32 = 231;
@@ -249,43 +267,86 @@ mod imp {
         /// The instance clients connect to next; always created ahead of time so
         /// there is never a moment with no instance (clients would get NotFound).
         next: NamedPipeServer,
+        /// Applied to *every* instance, not only the first: a later instance with the
+        /// default DACL would be a hole next to the locked-down one.
+        security: PipeSecurity,
     }
 
     impl Listener {
         /// `first_pipe_instance(true)` makes creation fail when any instance of
-        /// this pipe already exists, so a second daemon cannot start.
+        /// this pipe already exists, so a second daemon cannot start. The pipe is
+        /// created with an explicit DACL admitting only SYSTEM and Administrators.
         pub async fn bind(endpoint: &Endpoint) -> Result<Self, TransportError> {
-            let next = ServerOptions::new()
-                .first_pipe_instance(true)
-                .reject_remote_clients(true)
-                .create(endpoint.address())
-                .map_err(|err| match err.kind() {
-                    io::ErrorKind::PermissionDenied => TransportError::AlreadyRunning(endpoint.describe()),
-                    _ => err.into(),
-                })?;
+            let mut security = PipeSecurity::admins_only()?;
+            // SAFETY: the pointer comes from `security`, a valid SECURITY_ATTRIBUTES that
+            // outlives the call; `create` copies the descriptor.
+            let next = unsafe {
+                ServerOptions::new()
+                    .first_pipe_instance(true)
+                    .reject_remote_clients(true)
+                    .create_with_security_attributes_raw(endpoint.address(), security.as_attributes_ptr())
+            }
+            .map_err(|err| match err.kind() {
+                io::ErrorKind::PermissionDenied => TransportError::AlreadyRunning(endpoint.describe()),
+                _ => err.into(),
+            })?;
             Ok(Self {
                 endpoint: endpoint.clone(),
                 next,
+                security,
             })
         }
 
         pub async fn accept(&mut self) -> io::Result<Stream> {
             self.next.connect().await?;
             // Create the replacement *before* handing over the connected one.
-            let fresh = ServerOptions::new()
-                .reject_remote_clients(true)
-                .create(self.endpoint.address())?;
+            // SAFETY: as in `bind`; `self.security` is alive for the whole call.
+            let fresh = unsafe {
+                ServerOptions::new()
+                    .reject_remote_clients(true)
+                    .create_with_security_attributes_raw(self.endpoint.address(), self.security.as_attributes_ptr())
+            }?;
             Ok(Stream::Server(std::mem::replace(&mut self.next, fresh)))
         }
     }
 
+    /// When the ScriptRunner service is installed, the pipe's server must be that
+    /// service's process. Installed but not running means whatever owns the pipe
+    /// name is an impostor, so the client refuses rather than send it anything.
+    /// With no service installed (development, `scriptrunner daemon`) there is
+    /// nothing to compare against, so the check is skipped.
+    ///
+    /// The client keeps tokio's default `SECURITY_IDENTIFICATION`, so even a
+    /// server that slipped through could not impersonate the caller.
     pub async fn connect(endpoint: &Endpoint) -> Result<Stream, TransportError> {
+        let expected_server = match service_check::query()? {
+            ServiceProcess::NotInstalled => None,
+            ServiceProcess::NotRunning => return Err(TransportError::NotRunning(endpoint.describe())),
+            ServiceProcess::Running(pid) => Some(pid),
+        };
         for _ in 0..BUSY_ATTEMPTS {
             match ClientOptions::new().open(endpoint.address()) {
-                Ok(client) => return Ok(Stream::Client(client)),
+                Ok(client) => {
+                    if let Some(expected) = expected_server {
+                        let mut server_pid = 0u32;
+                        // SAFETY: the handle is this client's own open pipe handle, and the out-pointer is a valid local.
+                        let got =
+                            unsafe { GetNamedPipeServerProcessId(client.as_raw_handle() as HANDLE, &mut server_pid) };
+                        if got == 0 {
+                            return Err(io::Error::last_os_error().into());
+                        }
+                        if server_pid != expected {
+                            return Err(TransportError::ServerNotVerified(endpoint.describe()));
+                        }
+                    }
+                    return Ok(Stream::Client(client));
+                }
                 Err(err) if err.raw_os_error() == Some(ERROR_PIPE_BUSY) => tokio::time::sleep(BUSY_RETRY).await,
                 Err(err) if err.kind() == io::ErrorKind::NotFound => {
                     return Err(TransportError::NotRunning(endpoint.describe()));
+                }
+                Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+                    return Err(TransportError::AccessDenied(endpoint.describe()));
                 }
                 Err(err) => return Err(err.into()),
             }

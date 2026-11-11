@@ -42,3 +42,97 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+  windows-service:
+    name: windows service
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      # rustup reads the channel, components and profile from rust-toolchain.toml
+      # and installs them on first use.
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2.9.3
+
+      # bash is used so that a failing cargo build fails the step (bash runs with -e).
+      - name: Build
+        shell: bash
+        run: cargo build -p scriptrunner-service
+
+      # Runs against the default data directory (%ProgramData%\ScriptRunner); SCRIPTRUNNER_DATA_DIR is not set.
+      - name: Exercise the service
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = 'target\debug\scriptrunner.exe'
+
+          # PowerShell does not stop on native command failures, so every call goes through Run:
+          # it echoes the output and throws on a non-zero exit code.
+          function Run {
+            $out = & $exe @args | Out-String
+            Write-Host $out
+            if ($LASTEXITCODE -ne 0) {
+              throw "scriptrunner $($args -join ' ') failed with exit code $LASTEXITCODE"
+            }
+            return $out
+          }
+
+          function Assert-Contains([string]$text, [string]$needle) {
+            if (-not $text.Contains($needle)) {
+              throw "expected output to contain '$needle' but got: $text"
+            }
+          }
+
+          # 1. install, then the service must be stopped
+          Run service install | Out-Null
+          Assert-Contains (Run service status) 'stopped'
+
+          # 2. start, then the service must be running
+          Run service start | Out-Null
+          Assert-Contains (Run service status) 'running'
+
+          # 3. add and run a script through the running service
+          New-Item -ItemType Directory -Force -Path C:\sr-ci | Out-Null
+          Set-Content -Path C:\sr-ci\hello.bat -Encoding ascii -Value @('@echo off', 'echo hello-from-ci')
+          Run add Hello C:\sr-ci\hello.bat | Out-Null
+          Assert-Contains (Run list) 'Hello'
+          Assert-Contains (Run run Hello) 'hello-from-ci'
+
+          # 4. permissions on the data directory: no broad groups, SYSTEM and Administrators present
+          $acl = icacls "$env:ProgramData\ScriptRunner" | Out-String
+          if ($LASTEXITCODE -ne 0) {
+            throw "icacls failed with exit code $LASTEXITCODE"
+          }
+          Write-Host $acl
+          foreach ($bad in @('BUILTIN\Users', 'Everyone', 'Authenticated Users')) {
+            if ($acl.Contains($bad)) {
+              throw "ScriptRunner data directory grants access to '$bad'"
+            }
+          }
+          foreach ($good in @('NT AUTHORITY\SYSTEM', 'BUILTIN\Administrators')) {
+            if (-not $acl.Contains($good)) {
+              throw "ScriptRunner data directory does not grant access to '$good'"
+            }
+          }
+
+          # 5. stop, then the service must be stopped
+          Run service stop | Out-Null
+          Assert-Contains (Run service status) 'stopped'
+
+      # Cleanup runs even when earlier steps fail. Uninstall may fail if the service was never installed.
+      - name: Remove the service
+        if: always()
+        shell: pwsh
+        run: |
+          $exe = 'target\debug\scriptrunner.exe'
+          try {
+            & $exe service uninstall
+          } catch {
+            Write-Host "service uninstall skipped: $_"
+          }
+          Remove-Item -Recurse -Force C:\sr-ci, "$env:ProgramData\ScriptRunner" -ErrorAction SilentlyContinue

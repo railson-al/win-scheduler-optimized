@@ -70,12 +70,12 @@ mod imp {
             // the handle we create is owned by `Self` and closed in `Drop`.
             unsafe {
                 let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-                if !job.is_null() {
-                    if let Some(process) = child.raw_handle() {
-                        // Failure is tolerated: the executor still kills the
-                        // main process directly as a fallback.
-                        AssignProcessToJobObject(job, process as HANDLE);
-                    }
+                if !job.is_null()
+                    && let Some(process) = child.raw_handle()
+                {
+                    // Failure is tolerated: the executor still kills the
+                    // main process directly as a fallback.
+                    AssignProcessToJobObject(job, process as HANDLE);
                 }
                 Self { job }
             }

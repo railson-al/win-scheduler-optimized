@@ -13,13 +13,10 @@ use scriptrunner_core::logs::LogKind;
 use scriptrunner_core::{Execution, ExecutionId, ExecutionQuery, ExecutionStatus, Schedule, ScriptKind, Task};
 use scriptrunner_ipc::Event;
 use scriptrunner_ipc::client::{Client, ClientError};
-use scriptrunner_ipc::transport::{Endpoint, Listener};
-use scriptrunner_service::engine::Engine;
-use scriptrunner_service::ipc_server;
-use scriptrunner_storage::Storage;
+use scriptrunner_ipc::transport::Endpoint;
+use scriptrunner_service::{daemon, logging};
 use tokio::sync::broadcast::error::RecvError;
 use tokio_util::sync::CancellationToken;
-use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(name = "scriptrunner", version, about = "Script scheduler (engine harness)")]
@@ -35,6 +32,11 @@ struct Cli {
 enum Command {
     /// Run the scheduler in the foreground until Ctrl+C.
     Daemon,
+    /// Install, start, stop or remove the Windows service (Windows only; needs Administrator).
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
     /// Register a task.
     Add(Box<AddArgs>),
     /// List tasks with status and next run.
@@ -56,6 +58,23 @@ enum Command {
     },
     /// Print the log of an execution.
     Logs { execution: String },
+}
+
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// Create the service (LocalSystem, automatic start) and lock down the data directory.
+    Install,
+    /// Stop the service if needed and remove it. The data directory is kept.
+    Uninstall,
+    /// Start the service and wait until it is running.
+    Start,
+    /// Stop the service and wait until it has stopped.
+    Stop,
+    /// Show whether the service is installed and running.
+    Status,
+    /// What the Service Control Manager runs. Not meant to be typed by hand.
+    #[command(hide = true)]
+    Run,
 }
 
 #[derive(Args)]
@@ -157,6 +176,12 @@ async fn connect(dir: &Path) -> Result<Client> {
     match Client::connect(&Endpoint::for_data_dir(dir)).await {
         Ok(client) => Ok(client),
         Err(ClientError::NotRunning(_)) => {
+            if cfg!(windows) {
+                bail!(
+                    "the ScriptRunner daemon is not running; start the service with `scriptrunner service start` \
+                     (or run `scriptrunner daemon` in a console if the service is not installed)"
+                )
+            }
             bail!("the ScriptRunner daemon is not running; start it with `scriptrunner daemon`")
         }
         Err(err) => Err(err).context("connecting to the ScriptRunner daemon"),
@@ -245,7 +270,7 @@ fn print_execution(e: &Execution) {
 
 async fn run_client_command(client: &Client, command: Command) -> Result<()> {
     match command {
-        Command::Daemon => bail!("the daemon is started by main, not run as a client command"),
+        Command::Daemon | Command::Service { .. } => bail!("this command is handled by main, not as a client command"),
         Command::Add(args) => {
             let mut task = Task::new(&args.name, &args.script);
             if ScriptKind::from_path(&args.script).is_none() {
@@ -351,39 +376,130 @@ async fn run_client_command(client: &Client, command: Command) -> Result<()> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        .init();
-
+fn main() -> Result<()> {
     let cli = Cli::parse();
     let dir = data_dir(&cli);
 
+    // The service has no console, so it logs to a file and must not install the
+    // console logger first. It also owns its threads and runtime (see `service_run`).
+    if let Command::Service { action } = &cli.command {
+        return match action {
+            ServiceAction::Run => service_run(&dir),
+            other => service_command(other, &dir),
+        };
+    }
+
+    logging::init_console();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("starting the async runtime")?
+        .block_on(run_cli(cli, dir))
+}
+
+#[cfg(windows)]
+fn service_run(dir: &Path) -> Result<()> {
+    // Absolute, because the SCM starts the process in System32.
+    let dir = std::path::absolute(dir).context("resolving the data directory")?;
+    // First, before anything (the log directory included) is created inside it. If the
+    // directory fails the check, nothing is written into it: it may belong to an attacker,
+    // and SYSTEM appending to files there could be abused through links. The failure shows
+    // up as the service failing to start; `scriptrunner service install` repeats the check
+    // and says what is wrong.
+    scriptrunner_winsvc::manage::secure_data_dir(&dir).context("securing the data directory")?;
+    let _log = match logging::init_file(&dir.join("service")) {
+        Ok(guard) => guard,
+        Err(err) => {
+            // Nowhere to log yet; leave a trace the administrator can find.
+            logging::emergency(&dir, &format!("cannot start logging: {err:#}"));
+            return Err(err);
+        }
+    };
+    // A service has no console to print a panic to, so it goes to the log.
+    std::panic::set_hook(Box::new(|info| tracing::error!(panic = %info, "the service panicked")));
+    let result = scriptrunner_winsvc::run(Box::new({
+        let dir = dir.clone();
+        move |token, ready| {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("starting the async runtime")?;
+            let outcome = runtime.block_on(daemon::run(&dir, token, ready));
+            // Dropping a runtime waits for its blocking tasks (SQLite, files). Do not let one
+            // that is stuck keep a stopping service alive forever.
+            runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+            outcome
+        }
+    }));
+    if let Err(err) = &result {
+        logging::emergency(&dir, &format!("the service stopped with an error: {err:#}"));
+    }
+    result
+}
+
+#[cfg(windows)]
+fn service_command(action: &ServiceAction, dir: &Path) -> Result<()> {
+    use scriptrunner_winsvc::manage;
+
+    let dir = std::path::absolute(dir).context("resolving the data directory")?;
+    match action {
+        ServiceAction::Install => {
+            let executable = std::env::current_exe().context("finding this executable")?;
+            manage::install(&executable, &dir)?;
+            println!(
+                "installed the ScriptRunner service (data in {}); start it with `scriptrunner service start`",
+                dir.display()
+            );
+        }
+        ServiceAction::Uninstall => {
+            manage::uninstall()?;
+            println!("removed the ScriptRunner service (data kept in {})", dir.display());
+        }
+        ServiceAction::Start => {
+            manage::start()?;
+            println!("the ScriptRunner service is running");
+        }
+        ServiceAction::Stop => {
+            manage::stop()?;
+            println!("the ScriptRunner service is stopped");
+        }
+        ServiceAction::Status => println!("the ScriptRunner service is {}", manage::status()?),
+        ServiceAction::Run => bail!("`service run` is started by the Service Control Manager"),
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn service_run(_dir: &Path) -> Result<()> {
+    bail!("the Windows service only exists on Windows; use `scriptrunner daemon` here")
+}
+
+#[cfg(not(windows))]
+fn service_command(_action: &ServiceAction, _dir: &Path) -> Result<()> {
+    bail!("the Windows service only exists on Windows; use `scriptrunner daemon` here")
+}
+
+async fn run_cli(cli: Cli, dir: PathBuf) -> Result<()> {
     match cli.command {
         Command::Daemon => {
-            let storage = Storage::open(&dir.join("scriptrunner.db"))
-                .with_context(|| format!("opening database in {}", dir.display()))?;
-            let engine = Engine::new(storage, dir.clone())?;
-            // Claim the endpoint first. A second daemon must fail here, *before*
-            // `startup()` marks the first one's running executions as interrupted.
-            let endpoint = Endpoint::for_data_dir(&dir);
-            let listener = Listener::bind(&endpoint).await.context("starting the ipc server")?;
-            engine.startup()?;
-            tracing::info!(data_dir = %dir.display(), endpoint = %endpoint.address().display(), "daemon started");
+            // The pipe admits only administrators, and the default data directory is the
+            // production one, so the console daemon protects it the same way the service does.
+            #[cfg(windows)]
+            scriptrunner_winsvc::manage::secure_data_dir(&dir)
+                .context("securing the data directory (run the daemon from an elevated terminal)")?;
             let shutdown = CancellationToken::new();
-            let scheduler = tokio::spawn({
-                let engine = engine.clone();
+            tokio::spawn({
                 let shutdown = shutdown.clone();
-                async move { engine.run_scheduler(shutdown).await }
+                async move {
+                    // If the signal handler cannot be installed, stopping is the safe outcome:
+                    // a daemon nobody can interrupt is worse than one that exits.
+                    if let Err(err) = tokio::signal::ctrl_c().await {
+                        tracing::error!(%err, "cannot listen for Ctrl+C; stopping");
+                    }
+                    shutdown.cancel();
+                }
             });
-            let server = tokio::spawn(ipc_server::serve(engine.clone(), listener, shutdown.clone()));
-            tokio::signal::ctrl_c().await?;
-            tracing::info!("shutting down");
-            shutdown.cancel();
-            scheduler.await?;
-            server.await?;
-            engine.shutdown().await;
+            daemon::run(&dir, shutdown, || {}).await?;
         }
         command => {
             let client = connect(&dir).await?;

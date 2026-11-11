@@ -1,0 +1,24 @@
+[package]
+name = "scriptrunner-winsvc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Windows service plumbing for ScriptRunner (SCM dispatcher, control handling, install and uninstall)"
+
+# Everything here is Windows-only. The crate is empty elsewhere, so the workspace
+# still builds on Linux. It deliberately has no SQLite dependency, so it can be
+# type-checked for Windows from Linux without a C cross-compiler.
+[target."cfg(windows)".dependencies]
+anyhow = "1.0.104"
+scriptrunner-core = { version = "0.1.0", path = "../core" }
+tokio-util = "0.7.20"
+tracing = "0.1.44"
+windows-service = "0.8.1"
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Services",
+] }

@@ -5,7 +5,11 @@
 
 pub mod client;
 pub mod codec;
+#[cfg(windows)]
+mod pipe_security;
 pub mod protocol;
+#[cfg(windows)]
+mod service_check;
 pub mod transport;
 
 pub use protocol::{
