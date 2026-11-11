@@ -92,6 +92,12 @@ fn next_interval(every_secs: u64, anchor: DateTime<Utc>, after: DateTime<Utc>) -
     if every_secs == 0 || every_secs > MAX_INTERVAL_SECS {
         return None;
     }
+    // The database keeps slots with millisecond precision, truncating downwards.
+    // An anchor with sub-millisecond digits would yield slots that are stored
+    // slightly *earlier* than they really are, so a wake-up inside that gap sees
+    // the slot as still due and fires it again. Aligning the anchor to the
+    // millisecond makes every slot exactly representable.
+    let anchor = DateTime::from_timestamp_millis(anchor.timestamp_millis())?;
     let every = every_secs as i64;
     let elapsed = (after - anchor).num_seconds();
     let k = if elapsed < 0 { 1 } else { elapsed / every + 1 };
@@ -224,6 +230,25 @@ mod tests {
             s.next_after(utc(2024, 12, 31, 0, 0, 0), &Utc),
             Some(utc(2025, 1, 1, 10, 10, 0))
         );
+    }
+
+    #[test]
+    fn interval_slots_are_aligned_to_the_millisecond() {
+        // Regression: a sub-millisecond anchor produced slots the database stored
+        // earlier than the real value, which made a due slot fire repeatedly.
+        let anchor = utc(2025, 1, 1, 10, 0, 0) + Duration::nanoseconds(123_456_789);
+        let schedule = Schedule::Interval { every_secs: 1, anchor };
+        for offset_ns in [0, 1, 500_000, 999_999, 1_000_000, 123_000_000, 999_999_999] {
+            let after = utc(2025, 1, 1, 10, 0, 7) + Duration::nanoseconds(offset_ns);
+            let next = schedule.next_after(after, &Utc).unwrap();
+            assert_eq!(
+                next.timestamp_subsec_nanos() % 1_000_000,
+                0,
+                "slot {next} is not millisecond-aligned"
+            );
+            assert!(next > after, "slot {next} must lie after {after}");
+            assert!(next - after <= Duration::seconds(1));
+        }
     }
 
     #[test]

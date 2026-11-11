@@ -644,6 +644,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "rusqlite",
  "scriptrunner-core",
  "scriptrunner-storage",
  "serde_json",

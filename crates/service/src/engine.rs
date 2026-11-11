@@ -314,7 +314,7 @@ impl Engine {
     pub async fn run_scheduler(&self, shutdown: CancellationToken) {
         let mut last_housekeeping = Instant::now();
         loop {
-            let sleep_for = match self.fire_due(Utc::now()) {
+            let sleep_for = match self.blocking(|engine| engine.fire_due(Utc::now())).await {
                 Ok(next) => next
                     .map(|at| (at - Utc::now()).to_std().unwrap_or(Duration::ZERO))
                     .map_or(MAX_SLEEP, |wait| wait.min(MAX_SLEEP)),
@@ -324,7 +324,7 @@ impl Engine {
                 }
             };
             if last_housekeeping.elapsed() >= HOUSEKEEPING_EVERY {
-                if let Err(err) = self.housekeeping() {
+                if let Err(err) = self.blocking(|engine| engine.housekeeping()).await {
                     error!(%err, "housekeeping failed");
                 }
                 last_housekeeping = Instant::now();
@@ -339,6 +339,7 @@ impl Engine {
 
     /// Fires every due slot; returns the earliest remaining one.
     fn fire_due(&self, now: DateTime<Utc>) -> Result<Option<DateTime<Utc>>> {
+        let mut previous: Option<ScheduledSlot> = None;
         loop {
             let slots = self.inner.storage.list_scheduled()?;
             let Some(first) = slots.first() else { return Ok(None) };
@@ -346,8 +347,15 @@ impl Engine {
                 return Ok(Some(first.next_run_at));
             }
             // Each pass either claims the slot (advancing it into the future)
-            // or fails because someone else did; both make progress.
+            // or fails because someone else did; both make progress. Seeing the
+            // same slot twice in a row means the schedule did not advance, which
+            // would otherwise spin here forever creating executions.
+            if previous.as_ref() == Some(first) {
+                error!(task = %first.task_id, slot = %first.next_run_at, "schedule did not advance after firing; retrying later");
+                return Ok(Some(now + chrono::Duration::seconds(1)));
+            }
             self.fire(first.clone(), now)?;
+            previous = Some(first.clone());
         }
     }
 
@@ -444,20 +452,25 @@ impl Engine {
             execution.status = ExecutionStatus::Interrupted;
             execution.failure_reason = Some("stopped while waiting for a free execution slot".into());
             execution.finished_at = Some(Utc::now());
-            self.finish(&execution);
+            self.finish(&execution).await;
             return;
         };
 
-        let settings = self.inner.storage.load_settings().unwrap_or_else(|err| {
-            warn!(%err, "could not load settings, using defaults");
-            Settings::default()
-        });
+        let settings = self
+            .blocking(|engine| Ok(engine.inner.storage.load_settings()?))
+            .await
+            .unwrap_or_else(|err| {
+                warn!(%err, "could not load settings, using defaults");
+                Settings::default()
+            });
         let plan = executor::plan_command(&task, &settings);
 
         let mut writer = None;
         if task.capture_logs {
             let file = format!("{}.log", execution.id);
-            match LogWriter::create(&self.inner.logs_dir.join(&file), settings.max_log_bytes_per_execution) {
+            let path = self.inner.logs_dir.join(&file);
+            let max_bytes = settings.max_log_bytes_per_execution;
+            match self.blocking(move |_| Ok(LogWriter::create(&path, max_bytes)?)).await {
                 Ok(mut w) => {
                     let args: Vec<_> = plan.args.iter().map(|a| a.to_string_lossy()).collect();
                     let _ = w.write_meta(&format!(
@@ -474,14 +487,16 @@ impl Engine {
 
         execution.status = ExecutionStatus::Running;
         execution.started_at = Some(Utc::now());
-        self.persist(&execution);
+        self.persist(&execution).await;
         self.emit(Event::ExecutionChanged(execution.clone()));
 
         let (sink, consumer) = match writer {
             Some(mut w) => {
                 let (tx, mut rx) = mpsc::channel::<LogLine>(256);
-                let handle = tokio::spawn(async move {
-                    while let Some(line) = rx.recv().await {
+                // File writes are blocking I/O, so this consumer lives on the
+                // blocking pool instead of an async worker thread.
+                let handle = tokio::task::spawn_blocking(move || {
+                    while let Some(line) = rx.blocking_recv() {
                         let _ = w.write_line(&line);
                         while let Ok(more) = rx.try_recv() {
                             let _ = w.write_line(&more);
@@ -518,7 +533,7 @@ impl Engine {
             let seconds = execution
                 .duration()
                 .map_or(0.0, |d| d.num_milliseconds() as f64 / 1000.0);
-            let _ = w.write_meta(&format!(
+            let banner = format!(
                 "finished: {} (exit code {}, {seconds:.1}s){}",
                 execution.status,
                 execution.exit_code.map_or_else(|| "n/a".to_owned(), |c| c.to_string()),
@@ -527,22 +542,39 @@ impl Engine {
                     .as_deref()
                     .map(|r| format!(" - {r}"))
                     .unwrap_or_default(),
-            ));
-            let _ = w.flush();
-            execution.log_bytes = w.bytes_written();
-            execution.log_truncated = w.truncated();
+            );
+            let summary = tokio::task::spawn_blocking(move || {
+                let _ = w.write_meta(&banner);
+                let _ = w.flush();
+                (w.bytes_written(), w.truncated())
+            })
+            .await;
+            if let Ok((bytes, truncated)) = summary {
+                execution.log_bytes = bytes;
+                execution.log_truncated = truncated;
+            }
         }
-        self.finish(&execution);
+        self.finish(&execution).await;
     }
 
-    fn persist(&self, execution: &Execution) {
+    fn persist_blocking(&self, execution: &Execution) {
         if let Err(err) = self.inner.storage.update_execution(execution) {
             error!(%err, execution = %execution.id, "could not persist execution state");
         }
     }
 
-    fn finish(&self, execution: &Execution) {
-        self.persist(execution);
+    async fn persist(&self, execution: &Execution) {
+        let execution = execution.clone();
+        let _ = self
+            .blocking(move |engine| {
+                engine.persist_blocking(&execution);
+                Ok(())
+            })
+            .await;
+    }
+
+    async fn finish(&self, execution: &Execution) {
+        self.persist(execution).await;
         self.active().remove(&execution.id);
         self.emit(Event::ExecutionChanged(execution.clone()));
     }
@@ -584,6 +616,21 @@ impl Engine {
     }
 
     // ---- small helpers -------------------------------------------------
+
+    /// Runs synchronous work (SQLite, file system) on the blocking pool so it
+    /// never stalls the async runtime. A panic inside `f` is reported as an
+    /// error instead of propagating into the caller's task.
+    pub(crate) async fn blocking<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Engine) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let engine = self.clone();
+        match tokio::task::spawn_blocking(move || f(&engine)).await {
+            Ok(result) => result,
+            Err(join_error) => Err(EngineError::Io(std::io::Error::other(join_error))),
+        }
+    }
 
     fn active(&self) -> MutexGuard<'_, HashMap<ExecutionId, ActiveRun>> {
         self.inner.active.lock().unwrap_or_else(|p| p.into_inner())
@@ -866,6 +913,50 @@ mod tests {
 
         fx.engine.stop(&c.id);
         assert_eq!(finished(&fx.engine, &rd).await.status, ExecutionStatus::Success);
+    }
+
+    #[tokio::test]
+    async fn scheduler_does_not_block_the_runtime_while_the_database_is_busy() {
+        let fx = fixture();
+        let mut task = fx.script("tick.sh", "echo tick");
+        task.schedule = Some(Schedule::every_hours(1, Utc::now()));
+        let task = fx.engine.create_task(task).unwrap();
+        // Make the slot due right now (truncated to ms, the precision the database keeps).
+        let due = DateTime::from_timestamp_millis(Utc::now().timestamp_millis()).unwrap();
+        fx.engine.inner.storage.set_next_run(&task.id, Some(due)).unwrap();
+
+        // Another connection holds the write lock, so claiming the slot must wait for it.
+        let other = rusqlite::Connection::open(fx.dir.path().join("db.sqlite")).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let (shutdown, scheduler) = fx.start_scheduler();
+        // The runtime here has a single thread: if the scheduler blocked it on the
+        // database, these short sleeps would stall until SQLite's 5 s busy timeout.
+        let started = Instant::now();
+        for _ in 0..15 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the async runtime was blocked by the database"
+        );
+
+        // Releasing the lock lets the pending claim go through.
+        other.execute_batch("COMMIT").unwrap();
+        wait_until(
+            || {
+                fx.engine
+                    .executions(&ExecutionQuery::default())
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.trigger == Trigger::Scheduled)
+            },
+            "the scheduled run once the lock is released",
+        )
+        .await;
+        shutdown.cancel();
+        scheduler.await.unwrap();
+        fx.engine.shutdown().await;
     }
 
     #[tokio::test]
