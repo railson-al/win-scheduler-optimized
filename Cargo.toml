@@ -10,5 +10,6 @@ license = "MIT"
 [profile.release]
 lto = "thin"
 codegen-units = 1
-panic = "abort"
 strip = true
+# Deliberately no `panic = "abort"`: the engine runs each execution in its own
+# tokio task, so a panic there must not take the whole service down.

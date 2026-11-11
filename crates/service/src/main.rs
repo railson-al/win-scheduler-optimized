@@ -102,13 +102,18 @@ fn data_dir(cli: &Cli) -> PathBuf {
 }
 
 fn parse_every(text: &str) -> Result<u64> {
-    let (digits, unit) = text.split_at(text.len().saturating_sub(1));
-    let n: u64 = digits.parse().with_context(|| format!("bad interval {text:?} (use e.g. 15m or 2h)"))?;
-    match unit {
-        "m" => Ok(n * 60),
-        "h" => Ok(n * 3600),
-        _ => bail!("bad interval {text:?} (use e.g. 15m or 2h)"),
-    }
+    let usage = || format!("bad interval {text:?} (use e.g. 15m or 2h)");
+    // Split on the last *character*, not the last byte: a multibyte suffix must
+    // be an error, not a panic.
+    let unit = text.chars().next_back().with_context(usage)?;
+    let digits = &text[..text.len() - unit.len_utf8()];
+    let n: u64 = digits.parse().with_context(usage)?;
+    let seconds_per_unit: u64 = match unit {
+        'm' => 60,
+        'h' => 3600,
+        _ => bail!(usage()),
+    };
+    n.checked_mul(seconds_per_unit).with_context(|| format!("interval {text:?} is too large"))
 }
 
 fn parse_time(text: &str) -> Result<NaiveTime> {
@@ -283,4 +288,28 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_every;
+
+    #[test]
+    fn parses_minutes_and_hours() {
+        assert_eq!(parse_every("15m").unwrap(), 900);
+        assert_eq!(parse_every("2h").unwrap(), 7200);
+    }
+
+    #[test]
+    fn rejects_malformed_input_without_panicking() {
+        for bad in ["", "m", "15", "15x", "-5m", "1.5h", "15é", "é", "１５m"] {
+            assert!(parse_every(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_values_that_overflow() {
+        assert!(parse_every("18446744073709551615m").is_err());
+        assert!(parse_every("18446744073709551615h").is_err());
+    }
 }

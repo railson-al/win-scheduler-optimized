@@ -11,7 +11,7 @@ use scriptrunner_core::{
 };
 use scriptrunner_storage::{ExecutionQuery, ScheduledSlot, Storage, StorageError};
 use thiserror::Error;
-use tokio::sync::{Notify, Semaphore, broadcast, mpsc};
+use tokio::sync::{Notify, Semaphore, SemaphorePermit, broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -62,12 +62,40 @@ struct ActiveRun {
     cancel: CancellationToken,
 }
 
+/// Bookkeeping for the global execution slots. `total` is how many permits
+/// exist (free or held by running executions); `target` is the configured
+/// limit. While `total > target` (the limit was lowered with every slot busy),
+/// permits are retired as they are released.
+struct SlotState {
+    total: u32,
+    target: u32,
+}
+
+/// A held execution slot; on release it is either returned to the semaphore or
+/// retired, if the limit was lowered in the meantime.
+struct SlotPermit<'a> {
+    inner: &'a Inner,
+    permit: Option<SemaphorePermit<'a>>,
+}
+
+impl Drop for SlotPermit<'_> {
+    fn drop(&mut self) {
+        let Some(permit) = self.permit.take() else { return };
+        let mut state = self.inner.slot_state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.total > state.target {
+            state.total -= 1;
+            permit.forget();
+        }
+        // otherwise `permit` is dropped here and goes back to the semaphore
+    }
+}
+
 struct Inner {
     storage: Storage,
     logs_dir: PathBuf,
     active: Mutex<HashMap<ExecutionId, ActiveRun>>,
     slots: Semaphore,
-    slot_limit: Mutex<u32>,
+    slot_state: Mutex<SlotState>,
     wake: Notify,
     events: broadcast::Sender<Event>,
 }
@@ -90,7 +118,10 @@ impl Engine {
                 logs_dir,
                 active: Mutex::new(HashMap::new()),
                 slots: Semaphore::new(settings.max_concurrent_executions as usize),
-                slot_limit: Mutex::new(settings.max_concurrent_executions),
+                slot_state: Mutex::new(SlotState {
+                    total: settings.max_concurrent_executions,
+                    target: settings.max_concurrent_executions,
+                }),
                 wake: Notify::new(),
                 events,
             }),
@@ -253,14 +284,17 @@ impl Engine {
     /// (a *lowered* limit takes effect as running executions finish).
     pub fn update_settings(&self, settings: Settings) -> Result<()> {
         self.inner.storage.save_settings(&settings)?;
-        let mut limit = self.inner.slot_limit.lock().unwrap_or_else(|p| p.into_inner());
+        let mut state = self.inner.slot_state.lock().unwrap_or_else(|p| p.into_inner());
         let wanted = settings.max_concurrent_executions;
-        if wanted > *limit {
-            self.inner.slots.add_permits((wanted - *limit) as usize);
-            *limit = wanted;
-        } else if wanted < *limit {
-            let forgotten = self.inner.slots.forget_permits((*limit - wanted) as usize);
-            *limit -= forgotten as u32;
+        state.target = wanted;
+        if wanted > state.total {
+            self.inner.slots.add_permits((wanted - state.total) as usize);
+            state.total = wanted;
+        } else if wanted < state.total {
+            // Only idle permits can be removed now; the excess held by running
+            // executions is retired by `SlotPermit::drop` as they finish.
+            let forgotten = self.inner.slots.forget_permits((state.total - wanted) as usize);
+            state.total -= forgotten as u32;
         }
         Ok(())
     }
@@ -380,7 +414,7 @@ impl Engine {
             permit = self.inner.slots.acquire() => permit.ok(),
             _ = cancel.cancelled() => None,
         };
-        let Some(_permit) = permit else {
+        let Some(_slot) = permit.map(|permit| SlotPermit { inner: &self.inner, permit: Some(permit) }) else {
             execution.status = ExecutionStatus::Interrupted;
             execution.failure_reason = Some("stopped while waiting for a free execution slot".into());
             execution.finished_at = Some(Utc::now());
@@ -699,6 +733,40 @@ mod tests {
 
         fx.engine.stop(&a.id);
         assert_eq!(finished(&fx.engine, &second).await.status, ExecutionStatus::Success);
+    }
+
+    #[tokio::test]
+    async fn lowering_the_limit_while_slots_are_busy_still_takes_effect() {
+        let fx = fixture();
+        fx.engine.update_settings(Settings { max_concurrent_executions: 2, ..Settings::default() }).unwrap();
+        let a = fx.engine.create_task(fx.script("a.sh", "sleep 30")).unwrap();
+        let b = fx.engine.create_task(fx.script("b.sh", "sleep 30")).unwrap();
+        let ra = fx.engine.run_now(&a.id).unwrap();
+        let rb = fx.engine.run_now(&b.id).unwrap();
+        wait_until(
+            || [&ra, &rb].iter().all(|id| fx.engine.get_execution(id).unwrap().unwrap().status == ExecutionStatus::Running),
+            "both running",
+        )
+        .await;
+
+        // Every permit is in use, so none can be forgotten immediately.
+        fx.engine.update_settings(Settings { max_concurrent_executions: 1, ..Settings::default() }).unwrap();
+        fx.engine.stop(&a.id);
+        fx.engine.stop(&b.id);
+        finished(&fx.engine, &ra).await;
+        finished(&fx.engine, &rb).await;
+        wait_until(|| !fx.engine.is_running(&a.id) && !fx.engine.is_running(&b.id), "idle").await;
+
+        let c = fx.engine.create_task(fx.script("c.sh", "sleep 30")).unwrap();
+        let d = fx.engine.create_task(fx.script("d.sh", "echo d")).unwrap();
+        let rc = fx.engine.run_now(&c.id).unwrap();
+        wait_until(|| fx.engine.get_execution(&rc).unwrap().unwrap().status == ExecutionStatus::Running, "c running").await;
+        let rd = fx.engine.run_now(&d.id).unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(fx.engine.get_execution(&rd).unwrap().unwrap().status, ExecutionStatus::Queued);
+
+        fx.engine.stop(&c.id);
+        assert_eq!(finished(&fx.engine, &rd).await.status, ExecutionStatus::Success);
     }
 
     #[tokio::test]
