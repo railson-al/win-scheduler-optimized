@@ -54,6 +54,12 @@ Outros comandos: `enable`, `disable`, `delete`.
 - Timeout/stop encerra o script **e os filhos** (Job Object); nenhuma janela de console aparece.
 - `daemon` dispara 1 execução por slot, sem duplicatas; slots perdidos viram `skipped (missed…)`.
 
+## Integração contínua e versão do Rust
+
+- O CI (GitHub Actions) roda `cargo fmt --check`, `cargo clippy -D warnings` e `cargo test` em Ubuntu e Windows.
+- A toolchain é fixada em `rust-toolchain.toml` (Rust 1.99.1); o mínimo suportado é 1.88, por causa da edition 2024 e de let-chains.
+- O plano de desenvolvimento das próximas etapas está em `docs/PLANO-LEVA-0-1.md`.
+
 ## Desenvolvimento no Linux
 
 Tudo que é portátil compila e testa no Linux (`cargo test --workspace`). O código específico
