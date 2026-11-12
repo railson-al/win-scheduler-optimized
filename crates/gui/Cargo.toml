@@ -8,11 +8,36 @@ license.workspace = true
 rust-version = "1.95"
 description = "ScriptRunner graphical front end (egui). Talks to the daemon over IPC; has no SQLite."
 
+[lib]
+name = "scriptrunner_gui"
+path = "src/lib.rs"
+
+# The real application. Its Windows build asks for elevation (see build.rs).
 [[bin]]
 name = "scriptrunner-gui"
 path = "src/main.rs"
 
+# Task 3.1: opens a window with each renderer and reports what it got. Not elevated, so it can be
+# double-clicked on a test machine. Goes away once the renderer is decided (D14).
+[[bin]]
+name = "graphics-spike"
+path = "src/bin/graphics_spike.rs"
+
 [dependencies]
-# Both renderers are built so a single .exe can be tried either way on a machine without a GPU
-# (see the spike notes in docs/PLANO-LEVA-3.md, task 3.1). The final build keeps only one.
+# Both renderers are built so the spike can try either on a machine without a GPU (see
+# docs/PLANO-LEVA-3.md, task 3.1). The application itself asks for wgpu, the provisional choice;
+# the final build keeps only the renderer the spike picks.
 eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "glow", "wgpu", "wayland", "x11"] }
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+scriptrunner-core = { version = "0.1.0", path = "../core" }
+scriptrunner-ipc = { version = "0.1.0", path = "../ipc" }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "net", "io-util"] }
+
+[dev-dependencies]
+# The backend tests run against a real engine behind a real IPC server. The service (and, through
+# it, SQLite) is therefore a *test* dependency only: `cargo tree -p scriptrunner-gui -e normal,build`
+# must stay free of rusqlite.
+scriptrunner-service = { version = "0.1.0", path = "../service" }
+scriptrunner-storage = { version = "0.1.0", path = "../storage" }
+tempfile = "3.27.0"
+tokio-util = "0.7.20"

@@ -147,7 +147,9 @@ executores no mesmo arquivo. A 3.4 define a API que as telas consomem, então o 
 - Linux: testes do estado, do formulário e da formatação (sem janela), testes de integração do protocolo v2 e testes
   de interface com `egui_kittest`, com `clippy -D warnings` e `fmt` limpos.
 - CI em ubuntu e windows: o crate `gui` compila e testa. No Windows o job confere o manifesto no `.exe`.
-- O crate `gui` **não** puxa `rusqlite` (conferir com `cargo tree -p scriptrunner-gui`).
+- O crate `gui` **não** puxa `rusqlite` no código de produção (conferir com
+  `cargo tree -p scriptrunner-gui -e normal,build`; sem o `-e`, o `cargo tree` também lista as dependências de
+  teste, e os testes do backend usam o `service` e o `storage` de propósito).
 
 **Manual no Windows (só você consegue confirmar)**
 1. Abrir `scriptrunner-gui.exe` por duplo clique: o UAC aparece e, depois de aceitar, a janela abre.
@@ -229,9 +231,9 @@ OpenGL 4.6), o que **não responde** à dúvida do RDP.
 **O que só você consegue fazer, numa máquina Windows sem GPU (VM de servidor, ou sessão RDP):**
 
 ```powershell
-cargo build -p scriptrunner-gui
-.\target\debug\scriptrunner-gui.exe wgpu
-.\target\debug\scriptrunner-gui.exe glow
+cargo build -p scriptrunner-gui --bin graphics-spike
+.\target\debug\graphics-spike.exe wgpu
+.\target\debug\graphics-spike.exe glow
 ```
 
 Anote para cada um: se a janela abre e desenha, o texto do relatório (adaptador, backend, tipo de dispositivo) ou a
@@ -245,6 +247,82 @@ mensagem de erro do console. Critério de decisão para D14:
 | falha | falha | parar e discutir (renderização por software ou outra biblioteca) |
 
 Depois da decisão, o `Cargo.toml` do `gui` passa a ter só o renderer escolhido.
+
+### 3.2 Esqueleto e 3.3 Backend: prontas no Linux
+
+Feitas **antes** do resultado do spike, com `wgpu` provisório (a escolha é só uma feature do Cargo e não muda a
+lógica). Verificado: fmt limpo, `clippy -D warnings` no Linux e no alvo Windows, testes verdes (11 do `gui` em
+módulos puros, 11 de integração do backend contra um daemon real, 5 novos no `core`), oito rodadas seguidas dos
+testes do backend sem falha. **Não verificado:** a janela em si (nunca abri o `scriptrunner-gui` com tela), o
+manifesto de elevação (nenhum build MSVC rodou) e tudo no Windows.
+
+O que existe:
+
+- **D20:** `core::paths::data_dir(explicit)` resolve a pasta de dados (argumento, depois `SCRIPTRUNNER_DATA_DIR`,
+  depois o padrão da plataforma). O serviço usa a mesma função; a GUI também.
+- **Crate `gui` virou lib + dois binários.** `scriptrunner-gui` é a aplicação (esqueleto: barra de status e lista
+  de tarefas) e `graphics-spike` é o spike da 3.1, **renomeado**: o comando do Windows mudou (ver acima). O
+  manifesto `requireAdministrator` (`build.rs`, só para o `scriptrunner-gui`, só MSVC) usa
+  `/MANIFEST:EMBED` e `/MANIFESTUAC`; **a sintaxe das aspas desse argumento é de memória** e a 3.11 (conferir o
+  `.exe` no CI do Windows) é quem confirma. No alvo GNU, usado só para checar tipos daqui, avisa e não embute.
+- **`i18n.rs`:** enum `Text` e um `match` por idioma; acrescentar inglês é uma função nova e o compilador aponta o
+  que falta. **`fmt.rs`:** durações, data local (fuso por parâmetro, para testar), bytes, resumo de agenda, rótulo e
+  "tom" de status, texto da barra de conexão.
+- **`backend.rs`** (D16, D17, P3):
+  - `Backend::spawn(endpoint, config, repaint)` cria a thread com o runtime; a UI usa `send`, `try_recv` e `drain`,
+    que nunca esperam. Testado: 1000 comandos enviados sem daemon em menos de 1 s.
+  - Entra em `Subscribe` antes da primeira consulta, então nada se perde. `TasksChanged` e `ExecutionChanged`
+    refazem o `Overview` (juntando rajadas em uma consulta); `Resync` ou atraso do cliente refazem tudo e avisam
+    a UI com `Update::Resynced`.
+  - Sem daemon ou com a conexão perdida: `ConnectionState::Down { reason, retry_in }`, recuo de 1 s a 10 s (testado
+    com tempos curtos), e os comandos falham na hora com `Failure::NotConnected`. Reconecta sozinho, inclusive
+    depois de reiniciar o daemon (teste com os dados preservados).
+  - **Duas conexões:** comandos e eventos numa, leitura de log (acompanhar e exportar) na outra, aberta no primeiro
+    uso e trocada se quebrar. Teste: parar uma execução enquanto o log dela é acompanhado.
+  - `FollowLog { id, offset }` acompanha o log por `ReadLogFrom` até a execução terminar, lendo o estado da
+    execução **antes** do log (senão a última linha poderia se perder; o teste confere a linha `finished:`).
+    `LogUpdate::Chunk` traz `next_offset` para retomar depois de uma reconexão.
+  - `ExportLog { id, path }` grava o arquivo no backend; o texto inteiro passa pela memória (limite herdado do
+    `Client::export_log`).
+- **Decisões pequenas que tomei:** a thread do backend só termina quando a UI some (`Drop` fecha o canal); nenhuma
+  tela guarda estado do daemon além do que o `Update` entrega; as mensagens de erro do daemon aparecem como vêm (em
+  inglês), só as da própria GUI passam pela tabela de textos.
+- **Ainda não feito:** `state.rs` (3.4) e as telas. O `main.rs` atual só prova a ligação e será substituído.
+
+### 3.4 Estado: pronta no Linux
+
+`crates/gui/src/state.rs`, sem egui. Verificado: fmt, `clippy -D warnings` no Linux e no alvo Windows, 24 testes
+novos (35 no `gui`), suíte inteira verde, sem `rusqlite` na produção.
+
+API que as telas consomem:
+
+- **`AppState::apply(update, now) -> Vec<Command>`** aplica um `Update` do backend e devolve os comandos que o
+  chamador deve enviar (o estado não envia nada sozinho, então os testes veem exatamente o que cada transição pede).
+  O `main.rs` já faz esse laço (`pump`).
+- **`AppState::go(screen) -> Vec<Command>`** troca de tela com os efeitos certos: abrir o histórico consulta; abrir uma
+  execução carrega o cabeçalho e segue o log; sair de uma execução manda `StopFollowing`. Telas: `Dashboard`,
+  `TaskEditor { task: Option<TaskId> }`, `History`, `Execution(id)`, `Settings`.
+- **Painel:** `tasks` (substituída inteira a cada `Overview`, nunca mesclada), `tasks_loaded`, `search` e
+  `visible_tasks()` (busca por nome sem diferenciar maiúsculas), `running_count()`, `task(id)`, conexão e
+  `DaemonStatus::uptime_secs(now)` (continua contando entre relatórios).
+- **Histórico (`HistoryState`):** filtro (tarefa, status, período), página de 50 com uma linha a mais pedida para saber
+  se há próxima, `request`, `set_filter` (volta à página 0), `next_page`, `previous_page`. Resposta de consulta
+  antiga é ignorada (etiqueta `tag`); página que esvaziou volta uma; `ExecutionChanged` atualiza, remove ou insere
+  linhas sem nova consulta, só enquanto a tela está aberta.
+- **Log (`LogView`):** acumula `LogChunk`s da execução aberta (de outra execução, descarta), guarda `next_offset`,
+  filtro por stream, `visible()` e `visible_text()` (para copiar), teto de 200 000 linhas em memória
+  (`dropped` conta o que saiu da tela), `is_live()`, `missing`, `failure` com `retry_log()`.
+- **Avisos (`Notice`):** resultados (`Started`, `Stopped`, `TaskSaved`, `Exported`, `Done`, `Error`) numerados;
+  `notices_since(id)` deixa várias telas reagirem ao mesmo aviso (o editor fecha em `TaskSaved`). Falhas que têm
+  lugar na própria tela (`QueryHistory`, `GetExecution`, `FollowLog`) aparecem lá, não como aviso.
+
+Decisões:
+
+- **Reconexão refaz o que está aberto e retoma o log do `next_offset`;** `Resynced` refaz histórico e cabeçalho mas
+  **não** reinicia o acompanhamento do log (ele lê o arquivo, não depende de eventos). Um chunk repetido (dois
+  acompanhamentos sobrepostos na reconexão) é ignorado pelo `next_offset`, então nenhuma linha aparece duas vezes.
+- `Command` ganhou `PartialEq` (para os testes compararem o que o estado pede).
+- O formulário de tarefa (`form.rs`) **não** está aqui: é a 3.6, e o rascunho da edição fica nele, não no estado.
 
 ## Fora desta leva
 

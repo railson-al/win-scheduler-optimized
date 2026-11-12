@@ -2487,7 +2487,15 @@ dependencies = [
 name = "scriptrunner-gui"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "eframe",
+ "scriptrunner-core",
+ "scriptrunner-ipc",
+ "scriptrunner-service",
+ "scriptrunner-storage",
+ "tempfile",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]

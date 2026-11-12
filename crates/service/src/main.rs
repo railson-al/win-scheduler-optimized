@@ -108,23 +108,6 @@ struct AddArgs {
     cron: Option<String>,
 }
 
-fn data_dir(cli: &Cli) -> PathBuf {
-    if let Some(dir) = &cli.data_dir {
-        return dir.clone();
-    }
-    if cfg!(windows) {
-        let base = std::env::var_os("PROGRAMDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("C:\\ProgramData"));
-        return base.join("ScriptRunner");
-    }
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("scriptrunner")
-}
-
 fn parse_every(text: &str) -> Result<u64> {
     let usage = || format!("bad interval {text:?} (use e.g. 15m or 2h)");
     // Split on the last *character*, not the last byte: a multibyte suffix must
@@ -378,7 +361,7 @@ async fn run_client_command(client: &Client, command: Command) -> Result<()> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let dir = data_dir(&cli);
+    let dir = scriptrunner_core::paths::data_dir(cli.data_dir.clone());
 
     // The service has no console, so it logs to a file and must not install the
     // console logger first. It also owns its threads and runtime (see `service_run`).

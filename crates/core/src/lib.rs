@@ -11,6 +11,7 @@ pub mod errors;
 pub mod executor;
 pub mod logs;
 pub mod models;
+pub mod paths;
 pub mod schedule;
 
 pub use errors::{CoreError, Result};

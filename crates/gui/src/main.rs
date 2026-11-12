@@ -1,94 +1,100 @@
-//! Spike (task 3.1): opens a window with the renderer named on the command line and reports which
-//! graphics backend and device it really got. Its only job is to show, on a Windows machine with no
-//! GPU (an RDP session, a server VM), which renderer can open a window at all.
+//! ScriptRunner's window (skeleton, task 3.2).
 //!
-//! ```text
-//! scriptrunner-gui            # wgpu (eframe's default)
-//! scriptrunner-gui wgpu
-//! scriptrunner-gui glow       # OpenGL
-//! ```
+//! It already wires the pieces together: a [`Backend`] thread talks to the daemon, and the window
+//! shows the connection in a status bar and the tasks as a plain list. The real screens (3.5 to 3.9)
+//! replace the list; the wiring stays.
+//!
+//! On Windows this program asks for elevation (see `build.rs`), because the daemon's pipe only admits
+//! SYSTEM and Administrators.
+
+use std::time::Instant;
 
 use eframe::egui;
-use eframe::glow::{self, HasContext};
+use scriptrunner_core::paths;
+use scriptrunner_gui::backend::{Backend, BackendConfig, ConnectionState};
+use scriptrunner_gui::fmt;
+use scriptrunner_gui::i18n::{Text, t};
+use scriptrunner_gui::state::AppState;
+use scriptrunner_ipc::transport::Endpoint;
 
-struct Spike {
-    requested: &'static str,
-    report: String,
-    frames: u64,
+struct App {
+    backend: Backend,
+    state: AppState,
 }
 
-impl Spike {
-    fn new(requested: &'static str, cc: &eframe::CreationContext<'_>) -> Self {
-        let report = describe_backend(cc);
-        // Printed as well, so the answer survives even if the window is unreadable.
-        println!("requested renderer: {requested}");
-        println!("{report}");
-        Self {
-            requested,
-            report,
-            frames: 0,
+impl App {
+    /// Moves everything the backend has said into the state, and sends what the state asks for in answer.
+    fn pump(&mut self) {
+        let now = Instant::now();
+        while let Some(update) = self.backend.try_recv() {
+            for command in self.state.apply(update, now) {
+                self.backend.send(command);
+            }
         }
     }
+
+    fn status_bar(&self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(fmt::connection_summary(&self.state.connection));
+            if let ConnectionState::Connected { version, .. } = &self.state.connection {
+                ui.separator();
+                ui.label(format!("{} {version}", t(Text::DaemonVersion)));
+            }
+            if let Some(status) = &self.state.status {
+                ui.separator();
+                let uptime = status.uptime_secs(Instant::now());
+                ui.label(format!("{} {}", t(Text::Uptime), fmt::seconds(uptime)));
+            }
+        });
+    }
 }
 
-/// What the renderer actually got, as text.
-fn describe_backend(cc: &eframe::CreationContext<'_>) -> String {
-    if let Some(state) = &cc.wgpu_render_state {
-        let info = state.adapter.get_info();
-        return format!(
-            "wgpu\nadapter: {}\nbackend: {:?}\ndevice type: {:?}\ndriver: {} {}",
-            info.name, info.backend, info.device_type, info.driver, info.driver_info
-        );
-    }
-    if let Some(gl) = &cc.gl {
-        // SAFETY: plain queries on the context eframe just created and made current.
-        let (version, renderer) = unsafe {
-            (
-                gl.get_parameter_string(glow::VERSION),
-                gl.get_parameter_string(glow::RENDERER),
-            )
-        };
-        return format!("glow (OpenGL)\nversion: {version}\nrenderer: {renderer}");
-    }
-    "no renderer state available".to_owned()
-}
-
-impl eframe::App for Spike {
+impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.frames += 1;
+        self.pump();
+        // The uptime ticks without any update arriving.
+        ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+
+        egui::Panel::bottom("status_bar").show(ui, |ui| self.status_bar(ui));
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.heading("ScriptRunner: graphics spike");
-            ui.label(format!("requested: {}", self.requested));
-            ui.separator();
-            ui.monospace(&self.report);
-            ui.separator();
-            ui.label(format!("frames drawn: {}", self.frames));
-            if ui.button("Copy report").clicked() {
-                ui.ctx().copy_text(self.report.clone());
+            ui.heading(t(Text::AppTitle));
+            for row in self.state.visible_tasks() {
+                ui.horizontal(|ui| {
+                    ui.label(&row.task.name);
+                    if row.running {
+                        ui.label(t(Text::StatusRunning));
+                    } else if let Some(last) = &row.last_execution {
+                        ui.label(fmt::status_label(last.status));
+                    }
+                    if let Some(next) = row.next_run {
+                        ui.label(fmt::date_time_local(next));
+                    }
+                });
             }
         });
     }
 }
 
 fn main() -> eframe::Result {
-    let (name, renderer): (&'static str, eframe::Renderer) = match std::env::args().nth(1).as_deref() {
-        None | Some("wgpu") => ("wgpu", eframe::Renderer::Wgpu),
-        Some("glow") => ("glow", eframe::Renderer::Glow),
-        Some(other) => {
-            eprintln!("unknown renderer {other:?}; use `wgpu` or `glow`");
-            std::process::exit(2);
-        }
-    };
+    let endpoint = Endpoint::for_data_dir(&paths::data_dir(None));
     let options = eframe::NativeOptions {
-        renderer,
+        // wgpu is the provisional choice (D14), pending the spike on a Windows machine without a GPU.
+        renderer: eframe::Renderer::Wgpu,
         viewport: egui::ViewportBuilder::default()
-            .with_title("ScriptRunner (graphics spike)")
-            .with_inner_size([560.0, 340.0]),
+            .with_title(t(Text::AppTitle))
+            .with_inner_size([960.0, 600.0]),
         ..Default::default()
     };
     eframe::run_native(
-        "scriptrunner-gui-spike",
+        t(Text::AppTitle),
         options,
-        Box::new(move |cc| Ok(Box::new(Spike::new(name, cc)))),
+        Box::new(move |cc| {
+            let ctx = cc.egui_ctx.clone();
+            let backend = Backend::spawn(endpoint, BackendConfig::default(), move || ctx.request_repaint())?;
+            Ok(Box::new(App {
+                backend,
+                state: AppState::default(),
+            }))
+        }),
     )
 }
