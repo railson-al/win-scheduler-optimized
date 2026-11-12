@@ -6,7 +6,10 @@
 //! * [`fmt`]: durations, local dates, schedule summaries, status labels (D18, D19).
 //! * [`i18n`]: the one table of user-visible text (pt-BR for now).
 
+pub mod app;
 pub mod backend;
 pub mod fmt;
+pub mod form;
 pub mod i18n;
 pub mod state;
+pub mod views;

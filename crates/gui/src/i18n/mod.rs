@@ -6,6 +6,14 @@
 
 use chrono::Weekday;
 
+// One file of texts per screen, so that screens can be written side by side without touching the same
+// file. Each has its own `Text` enum and `t` function; the code and the language rules are the same.
+pub mod dashboard;
+pub mod editor;
+pub mod history;
+pub mod log_view;
+pub mod settings;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Lang {
     #[default]
@@ -17,6 +25,11 @@ pub enum Lang {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Text {
     AppTitle,
+
+    // Navigation bar.
+    NavDashboard,
+    NavHistory,
+    NavSettings,
 
     // Connection (status bar).
     Connecting,
@@ -104,6 +117,10 @@ pub fn weekday_short(lang: Lang, day: Weekday) -> &'static str {
 fn pt_br(key: Text) -> &'static str {
     match key {
         Text::AppTitle => "ScriptRunner",
+
+        Text::NavDashboard => "Tarefas",
+        Text::NavHistory => "Histórico",
+        Text::NavSettings => "Configurações",
 
         Text::Connecting => "Conectando ao serviço…",
         Text::Connected => "Conectado",

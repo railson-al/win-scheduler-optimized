@@ -324,6 +324,46 @@ Decisões:
 - `Command` ganhou `PartialEq` (para os testes compararem o que o estado pede).
 - O formulário de tarefa (`form.rs`) **não** está aqui: é a 3.6, e o rascunho da edição fica nele, não no estado.
 
+### 3.5 a 3.9 Telas: prontas no Linux
+
+Escritas por cinco agentes Haiku em paralelo (no máximo três por vez), cada um numa worktree própria e dono de um
+arquivo `views/<tela>.rs` e de um `i18n/<tela>.rs`; eu montei antes o terreno compartilhado e revisei e integrei
+cada entrega. Verificado: fmt, `clippy -D warnings` no Linux e no alvo Windows, 180 testes do `gui`, 11 de
+integração do backend, suíte inteira verde. **Não verificado:** nenhuma tela foi vista numa janela de verdade
+(os testes desenham em memória, sem clicar nem digitar), nenhum seletor de arquivo foi aberto, nada rodou no Windows.
+
+- **Contrato das telas** (`views/mod.rs`): `show(&mut self, ui, &mut AppState) -> Outcome`. A tela só desenha e
+  devolve o que o usuário pediu (`Outcome { commands, navigate }`); a casca (`app.rs`) é quem envia ao backend e
+  navega. Textos: um arquivo por tela em `i18n/`, mais a tabela comum em `i18n/mod.rs`.
+- **Casca (`app.rs`):** navegação por abas (Tarefas, Histórico, Configurações), barra de status, e o laço
+  `pump` que leva as atualizações do backend ao estado. `main.rs` só abre a janela.
+- **3.5 Painel:** tabela com agenda, próxima execução, último resultado e ações por linha; exclusão com confirmação;
+  ações desabilitadas sem conexão. **3.7 Histórico:** filtros (tarefa, status, período), páginas de 50, limpar
+  histórico da tarefa; o atalho de período só recalcula o `since` quando o usuário o troca (senão o filtro mudaria
+  sozinho a cada quadro). **3.9 Configurações:** rascunho com validação em pt-BR, tamanhos em MiB sem perda de ida e
+  volta, e o rascunho acompanha o serviço campo a campo sem apagar o que o usuário digitou.
+- **3.6 Editor:** `form.rs` (meu, 17 testes) faz modelo, validação e prévia das cinco próximas execuções no fuso
+  local, usando `Task::validate` e `Schedule::validate` do `core`; um intervalo que não muda de tamanho mantém a
+  âncora. A tela liga widgets a ele, fecha ao receber `TaskSaved` e mostra o erro do daemon se o salvar falhar. Os
+  seletores de arquivo (`rfd`) rodam numa thread própria. **3.8 Log:** lista virtualizada (`show_rows`) com cache
+  dos índices visíveis, filtro por saída, copiar, exportar para arquivo, cronômetro da execução em andamento.
+
+Pontos que ficaram para decidir ou medir:
+
+- **Salvar desabilitado em formulário novo.** Com nome e script em branco o botão fica cinza e só aparece a dica
+  "corrija para salvar", sem campo vermelho (os obrigatórios só ficam vermelhos depois de editados). Alternativa:
+  deixar Salvar clicável e revelar os erros ao clicar (uma linha em `editor.rs::actions`).
+- **"Parar" cancela todas as execuções da tarefa**, não só a aberta (o comando do backend é por tarefa). Decidir se
+  o botão deve avisar.
+- **Log de 200 mil linhas:** só foi testado o desenho com 5 000; falta medir o tempo de quadro.
+- **Erro do daemon na validação final** aparece como "valor fora do permitido" sob o campo Nome (é o que o
+  `form.rs` devolve para uma recusa que as checagens locais não previram).
+- **Estado das telas na memória do egui:** o painel, o histórico e as configurações guardam o estado local na
+  memória temporária do egui (ids fixos), porque foram escritas antes de eu permitir campos. Funciona e está
+  testado; migrar para campos da struct é opcional.
+- **Seletor de arquivo no Linux** pode exigir a thread principal em alguns backends; o alvo é o Windows, onde o
+  diálogo Win32 deve funcionar numa thread, mas isso não foi verificado.
+
 ## Fora desta leva
 
 Ícone de bandeja e notificações, instalador MSI, "executar como usuário", tema escuro e atalhos extras, importar e
