@@ -23,6 +23,7 @@ pub enum Text {
     LogTotalHelp,
 
     SectionRuns,
+    SectionPaths,
     ConcurrentLabel,
     ConcurrentHelp,
     TimeoutCheck,
@@ -74,6 +75,7 @@ fn pt_br(key: Text) -> &'static str {
         Text::LogTotalHelp => "Soma de todos os logs guardados. Não pode ser menor que o limite de uma execução.",
 
         Text::SectionRuns => "Execuções",
+        Text::SectionPaths => "Caminhos padrão",
         Text::ConcurrentLabel => "Execuções ao mesmo tempo",
         Text::ConcurrentHelp => "Quantas tarefas podem rodar juntas. Vale na hora para as próximas execuções.",
         Text::TimeoutCheck => "Usar tempo limite padrão",

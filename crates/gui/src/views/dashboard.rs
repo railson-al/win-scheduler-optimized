@@ -8,7 +8,7 @@ use chrono::{Local, TimeZone};
 use eframe::egui::{self, Id, RichText};
 use scriptrunner_core::{Execution, ExecutionStatus, Schedule, TaskId, TaskOverview};
 
-use super::{Outcome, theme};
+use super::{Outcome, theme, ui};
 use crate::backend::{Command, ConnectionState};
 use crate::fmt;
 use crate::i18n::dashboard::{Text, t};
@@ -153,35 +153,39 @@ impl DashboardView {
     pub fn show(&mut self, ui: &mut egui::Ui, state: &mut AppState) -> Outcome {
         let mut outcome = Outcome::default();
         let connected = state.is_connected();
+        let summary = summary_line(state.tasks.len(), state.running_count());
 
-        ui.horizontal(|ui| {
-            ui.heading(t(Text::Title));
-            ui.label(i18n::t(Common::Search));
-            ui.add(
-                egui::TextEdit::singleline(&mut state.search)
-                    .hint_text(t(Text::SearchHint))
-                    .desired_width(200.0),
-            );
-            if ui.button(t(Text::NewTask)).clicked() {
-                outcome.goto(Screen::TaskEditor { task: None });
-            }
-            if ui
-                .add_enabled(connected, egui::Button::new(i18n::t(Common::Refresh)))
-                .clicked()
-            {
-                outcome.send(Command::Refresh);
+        ui::page(ui, ui::TABLE_WIDTH, |ui| {
+            ui::header(ui, t(Text::Title), Some(&summary), |ui| {
+                let new_task = ui::primary_button(ui, t(Text::NewTask));
+                if ui.add(new_task).clicked() {
+                    outcome.goto(Screen::TaskEditor { task: None });
+                }
+                if ui
+                    .add_enabled(connected, egui::Button::new(i18n::t(Common::Refresh)))
+                    .clicked()
+                {
+                    outcome.send(Command::Refresh);
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label(i18n::t(Common::Search));
+                ui.add(
+                    egui::TextEdit::singleline(&mut state.search)
+                        .hint_text(t(Text::SearchHint))
+                        .desired_width(260.0),
+                );
+            });
+            ui.add_space(8.0);
+
+            match empty_state(state) {
+                Some(kind) => draw_empty(ui, &mut outcome, kind),
+                None => {
+                    let rows = state.visible_tasks();
+                    table(ui, &mut outcome, &rows, connected);
+                }
             }
         });
-        ui.label(summary_line(state.tasks.len(), state.running_count()));
-        ui.separator();
-
-        match empty_state(state) {
-            Some(kind) => draw_empty(ui, &mut outcome, kind),
-            None => {
-                let rows = state.visible_tasks();
-                table(ui, &mut outcome, &rows, connected);
-            }
-        }
 
         delete_dialog(ui, &mut outcome, state);
         outcome
@@ -196,7 +200,7 @@ fn table(ui: &mut egui::Ui, outcome: &mut Outcome, rows: &[&TaskOverview], conne
     egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
         egui::Grid::new("dashboard_tasks")
             .striped(true)
-            .spacing([18.0, 8.0])
+            .spacing([24.0, 10.0])
             .show(ui, |ui| {
                 for header in [
                     i18n::t(Common::ColName),
@@ -254,11 +258,12 @@ fn delete_dialog(ui: &mut egui::Ui, outcome: &mut Outcome, state: &AppState) {
     // `Some(true)` confirms, `Some(false)` cancels; a click outside the dialog cancels too.
     let mut answer = None;
     let modal = egui::Modal::new(ui.scope_id().with("dashboard_delete_modal")).show(ui.ctx(), |ui| {
-        ui.set_max_width(360.0);
+        ui.set_max_width(ui::DIALOG_WIDTH);
         ui.heading(t(Text::DeleteTitle));
         ui.label(delete_question(&task.name));
         ui.add_space(12.0);
-        ui.horizontal(|ui| {
+        ui::buttons_right(ui, |ui| {
+            // The primary action comes first: it is the rightmost button.
             if ui
                 .add_enabled(connected, egui::Button::new(i18n::t(Common::Delete)))
                 .clicked()

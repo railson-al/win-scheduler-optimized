@@ -4,7 +4,7 @@
 
 use std::time::{Duration, Instant};
 
-use eframe::egui;
+use eframe::egui::{self, Margin, RichText};
 
 use crate::backend::Backend;
 use crate::i18n::{Text, t};
@@ -68,7 +68,14 @@ impl App {
     }
 
     fn navigation(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::new()
+            .inner_margin(Margin::symmetric(16, 6))
+            .show(ui, |ui| self.tabs(ui));
+    }
+
+    fn tabs(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
             let on = &self.state.screen;
             let tabs = [
                 (
@@ -85,7 +92,13 @@ impl App {
             ];
             let mut target = None;
             for (label, screen, selected) in tabs {
-                if ui.selectable_label(selected, t(label)).clicked() && !selected {
+                // The selected tab is strong as well as filled, so the current screen reads at a glance.
+                let text = if selected {
+                    RichText::new(t(label)).strong()
+                } else {
+                    RichText::new(t(label))
+                };
+                if ui.selectable_label(selected, text).clicked() && !selected {
                     target = Some(screen);
                 }
             }

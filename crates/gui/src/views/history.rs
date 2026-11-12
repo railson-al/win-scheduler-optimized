@@ -12,8 +12,7 @@ use chrono::{DateTime, Duration, Local, TimeZone, Utc};
 use eframe::egui;
 use scriptrunner_core::{Execution, ExecutionStatus, TaskId, TaskOverview};
 
-use super::Outcome;
-use super::theme;
+use super::{Outcome, theme, ui};
 use crate::backend::{Command, Failure};
 use crate::fmt::{self, Tone};
 use crate::i18n::history::{Text, t};
@@ -198,16 +197,19 @@ impl HistoryView {
         let memo_id = egui::Id::unique("history_screen");
         let mut memo: Memo = ui.ctx().data_mut(|data| data.get_temp(memo_id)).unwrap_or_default();
 
-        ui.heading(t(Text::Title));
-        filter_bar(ui, state, &mut memo, &mut outcome);
-        ui.separator();
-        // The footer is added before the list: a panel at the bottom takes its space first, and the list
-        // fills whatever is left.
-        pages_footer(ui, state, &mut outcome);
-        banner_line(ui, state);
-        // Both directions: a long task name or failure reason makes the table wider than the window, and it
-        // must stay reachable.
-        egui::ScrollArea::both().show(ui, |ui| table(ui, state, &mut outcome));
+        ui::page(ui, ui::TABLE_WIDTH, |ui| {
+            ui::header(ui, t(Text::Title), None, |_| {});
+            filter_bar(ui, state, &mut memo, &mut outcome);
+            ui.separator();
+            ui.add_space(4.0);
+            // The footer is added before the list: a panel at the bottom takes its space first, and the list
+            // fills whatever is left.
+            pages_footer(ui, state, &mut outcome);
+            banner_line(ui, state);
+            // Both directions: a long task name or failure reason makes the table wider than the window, and it
+            // must stay reachable.
+            egui::ScrollArea::both().show(ui, |ui| table(ui, state, &mut outcome));
+        });
         clear_dialog(ui.ctx(), &mut memo, &mut outcome);
 
         ui.ctx().data_mut(|data| data.insert_temp(memo_id, memo));
@@ -370,17 +372,18 @@ fn clear_dialog(ctx: &egui::Context, memo: &mut Memo, outcome: &mut Outcome) {
         return;
     };
     let response = egui::Modal::new(egui::Id::unique("history_clear")).show(ctx, |ui| {
+        ui.set_max_width(ui::DIALOG_WIDTH);
         ui.heading(t(Text::ClearTitle));
         ui.label(t(Text::ClearBody));
         ui.add_space(8.0);
         ui.strong(pending.name.as_str());
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
+        ui.add_space(12.0);
+        ui::buttons_right(ui, |ui| {
+            // The primary action comes first: it is the rightmost button.
             let confirm = ui.button(t(Text::ClearConfirm)).clicked();
             let cancel = ui.button(common(Common::Cancel)).clicked();
             (confirm, cancel)
         })
-        .inner
     });
 
     let (confirm, cancel) = response.inner;

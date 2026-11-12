@@ -25,6 +25,7 @@ pub mod log_view;
 pub mod settings;
 pub mod status_bar;
 pub mod theme;
+pub mod ui;
 
 #[cfg(test)]
 pub mod testing;

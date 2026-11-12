@@ -10,8 +10,7 @@ use std::path::{Path, PathBuf};
 use eframe::egui::{self, RichText};
 use scriptrunner_core::Settings;
 
-use super::Outcome;
-use super::theme;
+use super::{Outcome, theme, ui};
 use crate::backend::Command;
 use crate::fmt::Tone;
 use crate::i18n::{
@@ -42,15 +41,18 @@ impl SettingsView {
         let connected = state.is_connected();
         let service_changed = form.service_changed;
 
-        ui.heading(t(Text::Title));
         let discard = match (state.settings.as_ref(), form.draft.as_mut()) {
             (Some(base), Some(draft)) => draw_form(ui, connected, draft, base, service_changed, &mut outcome),
-            _ if connected => {
-                ui.label(t(Text::Loading));
-                false
-            }
             _ => {
-                ui.label(i18n::t(i18n::Text::NotConnected));
+                let waiting = if connected {
+                    t(Text::Loading)
+                } else {
+                    i18n::t(i18n::Text::NotConnected)
+                };
+                ui::page(ui, ui::FORM_WIDTH, |ui| {
+                    ui::header(ui, t(Text::Title), None, |_| {});
+                    ui.label(waiting);
+                });
                 false
             }
         };
@@ -300,6 +302,8 @@ impl SettingsForm {
 }
 
 /// Draws the form and reports what the user asked for. Returns `true` when the user discards their edits.
+///
+/// The title and the buttons stay at the top; the settings scroll below them, one card per group.
 fn draw_form(
     ui: &mut egui::Ui,
     connected: bool,
@@ -313,17 +317,39 @@ fn draw_form(
     let dark = ui.visuals().dark_mode;
     let mut discard = false;
 
-    ui.weak(t(Text::Intro));
-    if service_changed {
-        ui.colored_label(theme::tone_color(Tone::Warn, dark), t(Text::ServiceChanged));
-    }
-    ui.add_space(8.0);
+    ui::page(ui, ui::FORM_WIDTH, |ui| {
+        ui::header(ui, t(Text::Title), None, |ui| {
+            let save = ui::primary_button(ui, i18n::t(i18n::Text::Save));
+            if ui.add_enabled(draft.can_save(connected, base), save).clicked()
+                && let Some(settings) = draft.to_settings()
+            {
+                outcome.send(Command::UpdateSettings(settings));
+            }
+            if ui.add_enabled(dirty, egui::Button::new(t(Text::Discard))).clicked() {
+                discard = true;
+            }
+        });
+        ui.label(RichText::new(t(Text::Intro)).weak());
+        if service_changed {
+            ui.colored_label(theme::tone_color(Tone::Warn, dark), t(Text::ServiceChanged));
+        }
+        if !connected {
+            ui.label(RichText::new(t(Text::ConnectToSave)).weak());
+        }
+    });
 
-    egui::ScrollArea::vertical().show(ui, |ui| {
-        ui.strong(t(Text::SectionHistory));
+    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        ui::page(ui, ui::FORM_WIDTH, |ui| draw_sections(ui, draft, &errors))
+    });
+    discard
+}
+
+/// The four cards of the settings: the history, the logs, the runs and the default paths.
+fn draw_sections(ui: &mut egui::Ui, draft: &mut SettingsDraft, errors: &[FieldError]) {
+    ui::section(ui, t(Text::SectionHistory), None, |ui| {
         field(
             ui,
-            &errors,
+            errors,
             None,
             |ui| {
                 ui.add(egui::DragValue::new(&mut draft.history_retention_days).range(0..=u32::MAX));
@@ -331,12 +357,12 @@ fn draw_form(
             t(Text::RetentionLabel),
             t(Text::RetentionHelp),
         );
+    });
 
-        ui.add_space(8.0);
-        ui.strong(t(Text::SectionLogs));
+    ui::section(ui, t(Text::SectionLogs), None, |ui| {
         field(
             ui,
-            &errors,
+            errors,
             Some(Field::LogPerExecution),
             |ui| {
                 ui.add(
@@ -352,7 +378,7 @@ fn draw_form(
         );
         field(
             ui,
-            &errors,
+            errors,
             Some(Field::LogTotal),
             |ui| {
                 ui.add(
@@ -366,12 +392,12 @@ fn draw_form(
             t(Text::LogTotalLabel),
             t(Text::LogTotalHelp),
         );
+    });
 
-        ui.add_space(8.0);
-        ui.strong(t(Text::SectionRuns));
+    ui::section(ui, t(Text::SectionRuns), None, |ui| {
         field(
             ui,
-            &errors,
+            errors,
             Some(Field::MaxConcurrent),
             |ui| {
                 ui.add(egui::DragValue::new(&mut draft.max_concurrent).range(1..=u32::MAX));
@@ -379,10 +405,9 @@ fn draw_form(
             t(Text::ConcurrentLabel),
             t(Text::ConcurrentHelp),
         );
-
         field(
             ui,
-            &errors,
+            errors,
             Some(Field::Timeout),
             |ui| {
                 ui.checkbox(&mut draft.timeout_enabled, t(Text::TimeoutCheck));
@@ -397,53 +422,34 @@ fn draw_form(
             t(Text::TimeoutLabel),
             t(Text::TimeoutHelp),
         );
+    });
 
+    ui::section(ui, t(Text::SectionPaths), None, |ui| {
         field(
             ui,
-            &errors,
+            errors,
             None,
             |ui| {
-                ui.add(egui::TextEdit::singleline(&mut draft.scripts_dir).desired_width(360.0));
+                ui.add(egui::TextEdit::singleline(&mut draft.scripts_dir).desired_width(ui.available_width()));
             },
             t(Text::ScriptsDirLabel),
             t(Text::ScriptsDirHelp),
         );
         field(
             ui,
-            &errors,
+            errors,
             None,
             |ui| {
-                ui.add(egui::TextEdit::singleline(&mut draft.python).desired_width(360.0));
+                ui.add(egui::TextEdit::singleline(&mut draft.python).desired_width(ui.available_width()));
             },
             t(Text::PythonLabel),
             t(Text::PythonHelp),
         );
     });
-
-    ui.add_space(8.0);
-    ui.horizontal(|ui| {
-        if ui
-            .add_enabled(
-                draft.can_save(connected, base),
-                egui::Button::new(i18n::t(i18n::Text::Save)),
-            )
-            .clicked()
-            && let Some(settings) = draft.to_settings()
-        {
-            outcome.send(Command::UpdateSettings(settings));
-        }
-        if ui.add_enabled(dirty, egui::Button::new(t(Text::Discard))).clicked() {
-            discard = true;
-        }
-        if !connected {
-            ui.weak(t(Text::ConnectToSave));
-        }
-    });
-    discard
 }
 
-/// One setting: its name, the control, a short help line and, when the draft breaks a rule for it, the
-/// error in red. `error_for` is the field whose errors to show; `None` for fields without rules.
+/// One setting: its name, the control, then (under it) the error in red, if the draft breaks a rule for it,
+/// and a short help line. `error_for` is the field whose errors to show; `None` for fields without rules.
 fn field(
     ui: &mut egui::Ui,
     errors: &[FieldError],
@@ -452,15 +458,21 @@ fn field(
     label: &str,
     help: &str,
 ) {
-    ui.label(RichText::new(label));
-    ui.horizontal(|ui| control(ui));
-    ui.weak(help);
-    if let Some(field) = error_for
-        && let Some(error) = errors.iter().find(|error| error.field == field)
-    {
-        ui.colored_label(theme::tone_color(Tone::Bad, ui.visuals().dark_mode), t(error.message));
-    }
-    ui.add_space(4.0);
+    let error = error_for.and_then(|field| errors.iter().find(|error| error.field == field));
+    let bad = theme::tone_color(Tone::Bad, ui.visuals().dark_mode);
+    ui::field(
+        ui,
+        label,
+        |ui| {
+            ui.horizontal(|ui| control(ui));
+        },
+        |ui| {
+            if let Some(error) = error {
+                ui.colored_label(bad, t(error.message));
+            }
+            ui.label(RichText::new(help).small().weak());
+        },
+    );
 }
 
 #[cfg(test)]

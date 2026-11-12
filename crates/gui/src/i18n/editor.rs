@@ -21,7 +21,11 @@ pub enum Text {
     // Sections.
     SectionGeneral,
     SectionScript,
+    SectionScriptCaption,
+    SectionExecution,
+    SectionExecutionCaption,
     SectionSchedule,
+    SectionScheduleCaption,
     SectionPreview,
 
     // General fields.
@@ -129,8 +133,12 @@ fn pt_br(key: Text) -> &'static str {
         Text::NotConnectedHint => "Sem conexão com o serviço. Não é possível salvar agora.",
 
         Text::SectionGeneral => "Geral",
-        Text::SectionScript => "Script e execução",
+        Text::SectionScript => "Script",
+        Text::SectionScriptCaption => "O que roda, com quais argumentos e em qual pasta.",
+        Text::SectionExecution => "Execução",
+        Text::SectionExecutionCaption => "Limites e o que acontece a cada execução.",
         Text::SectionSchedule => "Agenda",
+        Text::SectionScheduleCaption => "Quando a tarefa roda sozinha.",
         Text::SectionPreview => "Próximas execuções",
 
         Text::Name => "Nome",

@@ -8,6 +8,7 @@ use scriptrunner_core::paths;
 use scriptrunner_gui::app::App;
 use scriptrunner_gui::backend::{Backend, BackendConfig};
 use scriptrunner_gui::i18n::{Text, t};
+use scriptrunner_gui::views::theme;
 use scriptrunner_ipc::transport::Endpoint;
 
 fn main() -> eframe::Result {
@@ -25,6 +26,7 @@ fn main() -> eframe::Result {
         t(Text::AppTitle),
         options,
         Box::new(move |cc| {
+            theme::apply_style(&cc.egui_ctx);
             let ctx = cc.egui_ctx.clone();
             let backend = Backend::spawn(endpoint, BackendConfig::default(), move || ctx.request_repaint())?;
             Ok(Box::new(App::new(backend)))

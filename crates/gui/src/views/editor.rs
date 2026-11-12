@@ -11,7 +11,7 @@ use chrono::{DateTime, Local, TimeZone, Timelike, Utc};
 use eframe::egui::{self, Id, RichText, Ui};
 use scriptrunner_core::{RunAs, ScriptKind, TaskId};
 
-use super::{Outcome, theme};
+use super::{Outcome, theme, ui};
 use crate::backend::{Action, Command, Failure};
 use crate::fmt::{self, Tone};
 use crate::form::{Field, FormError, PREVIEW_RUNS, Problem, ScheduleForm, ScheduleKind, TaskForm, TimeUnit, WEEK};
@@ -285,18 +285,22 @@ impl TaskEditorView {
         let task = requested.as_ref().and_then(|id| state.task(id));
         match decide_target(requested.as_ref(), task.is_some(), state.tasks_loaded) {
             Target::Loading => {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(t(Text::Loading));
+                ui::page(ui, ui::FORM_WIDTH, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(t(Text::Loading));
+                    });
                 });
                 return outcome;
             }
             Target::NotFound => {
-                ui.heading(t(Text::NotFound));
-                ui.label(t(Text::NotFoundHint));
-                if ui.button(t(Text::Back)).clicked() {
-                    outcome.goto(Screen::Dashboard);
-                }
+                ui::page(ui, ui::FORM_WIDTH, |ui| {
+                    ui.heading(t(Text::NotFound));
+                    ui.label(t(Text::NotFoundHint));
+                    if ui.button(t(Text::Back)).clicked() {
+                        outcome.goto(Screen::Dashboard);
+                    }
+                });
                 return outcome;
             }
             Target::New | Target::Existing => {}
@@ -339,13 +343,12 @@ fn draw(ui: &mut Ui, session: &mut Session, state: &AppState, outcome: &mut Outc
     }
 
     let errors = session.form.errors();
-    let clicks = egui::Panel::bottom("editor_actions")
-        .show(ui, |ui| actions(ui, session, state, errors.is_empty()))
-        .inner;
+    // The title and the buttons stay in place; only the form below them scrolls.
+    let clicks = ui::page(ui, ui::FORM_WIDTH, |ui| actions(ui, session, state, errors.is_empty()));
 
-    let area = egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .show(ui, |ui| form_ui(ui, session, &errors));
+    let area = egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        ui::page(ui, ui::FORM_WIDTH, |ui| form_ui(ui, session, &errors))
+    });
     session.content_height = area.content_size.y;
     let request = area.inner;
     if let Some(pick) = request
@@ -460,15 +463,15 @@ fn dialog(pick: Pick) -> Option<PathBuf> {
 
 fn discard_dialog(ctx: &egui::Context) -> Answer {
     let response = egui::Modal::new(Id::unique("editor_discard_changes")).show(ctx, |ui| {
-        ui.set_max_width(360.0);
+        ui.set_max_width(ui::DIALOG_WIDTH);
         ui.heading(t(Text::DiscardTitle));
         ui.label(t(Text::DiscardBody));
-        ui.horizontal(|ui| {
+        ui.add_space(12.0);
+        ui::buttons_right(ui, |ui| {
             let discard = ui.button(t(Text::Discard)).clicked();
             let keep = ui.button(t(Text::KeepEditing)).clicked();
             (discard, keep)
         })
-        .inner
     });
     let (discard, keep) = response.inner;
     if discard {
@@ -480,32 +483,21 @@ fn discard_dialog(ctx: &egui::Context) -> Answer {
     }
 }
 
+/// The title of the screen with the save and cancel buttons on the right, then the lines that say what holds
+/// the save back.
 fn actions(ui: &mut Ui, session: &Session, state: &AppState, valid: bool) -> Clicks {
-    let dark = ui.visuals().dark_mode;
     let saving = session.saving.is_some();
     let mut clicks = Clicks::default();
-
-    ui.add_space(6.0);
-    if let Some(error) = &session.save_error {
-        ui.label(RichText::new(t(Text::SaveFailed)).color(theme::tone_color(Tone::Bad, dark)));
-        ui.label(RichText::new(error.as_str()).color(theme::tone_color(Tone::Bad, dark)));
-    }
-    if session.picker.is_some() {
-        ui.label(RichText::new(t(Text::PickerOpen)).weak());
-    } else if !valid {
-        ui.label(RichText::new(t(Text::FixToSave)).weak());
-    }
-    ui.horizontal(|ui| {
-        let save_enabled = can_save(valid, state.is_connected(), saving);
-        if ui
-            .add_enabled(save_enabled, egui::Button::new(i18n::t(Common::Save)))
-            .clicked()
-        {
+    let title = t(if session.target.is_some() {
+        Text::EditTitle
+    } else {
+        Text::NewTitle
+    });
+    let save_enabled = can_save(valid, state.is_connected(), saving);
+    let save = ui::primary_button(ui, i18n::t(Common::Save));
+    ui::header(ui, title, None, |ui| {
+        if ui.add_enabled(save_enabled, save).clicked() {
             clicks.save = true;
-        }
-        if saving {
-            ui.spinner();
-            ui.label(t(Text::Saving));
         }
         if ui
             .add_enabled(!saving, egui::Button::new(i18n::t(Common::Cancel)))
@@ -514,11 +506,31 @@ fn actions(ui: &mut Ui, session: &Session, state: &AppState, valid: bool) -> Cli
             clicks.cancel = true;
         }
     });
+    status_lines(ui, session, state, valid);
+    clicks
+}
+
+/// What holds the save back, and how a save that failed went. Shown under the title.
+fn status_lines(ui: &mut Ui, session: &Session, state: &AppState, valid: bool) {
+    let bad = theme::tone_color(Tone::Bad, ui.visuals().dark_mode);
+    if let Some(error) = &session.save_error {
+        ui.label(RichText::new(t(Text::SaveFailed)).color(bad));
+        ui.label(RichText::new(error.as_str()).color(bad));
+    }
+    if session.saving.is_some() {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label(t(Text::Saving));
+        });
+    }
+    if session.picker.is_some() {
+        ui.label(RichText::new(t(Text::PickerOpen)).weak());
+    } else if !valid {
+        ui.label(RichText::new(t(Text::FixToSave)).weak());
+    }
     if !state.is_connected() {
         ui.label(RichText::new(t(Text::NotConnectedHint)).weak());
     }
-    ui.add_space(6.0);
-    clicks
 }
 
 /// The room for a row made of a text field with a button on its right: all the width, one button tall.
@@ -530,50 +542,44 @@ fn row_size(ui: &Ui) -> egui::Vec2 {
     egui::vec2(ui.available_width(), ui.spacing().interact_size.y)
 }
 
-/// Draws the form. Returns the file dialog the user asked for, if any.
+/// Draws the form, one card per part. Returns the file dialog the user asked for, if any.
 fn form_ui(ui: &mut Ui, session: &mut Session, errors: &[FormError]) -> Option<Pick> {
     let mut request = None;
-    ui.heading(t(if session.target.is_some() {
-        Text::EditTitle
-    } else {
-        Text::NewTitle
-    }));
+    let busy = session.picker.is_some();
 
-    section(ui, Text::SectionGeneral);
-    egui::Grid::new("editor_general")
-        .num_columns(2)
-        .spacing([16.0, 10.0])
-        .show(ui, |ui| {
-            ui.label(t(Text::Name));
-            ui.vertical(|ui| {
+    ui::section(ui, t(Text::SectionGeneral), None, |ui| {
+        let name_problem = problem_for(errors, session, Field::Name);
+        ui::field(
+            ui,
+            t(Text::Name),
+            |ui| {
                 let response =
                     ui.add(egui::TextEdit::singleline(&mut session.form.name).desired_width(ui.available_width()));
                 touch_if(&mut session.touched, Field::Name, response.changed());
-                problem_label(ui, errors, session, Field::Name);
-                help(ui, Text::HelpName);
-            });
-            ui.end_row();
-
-            ui.label(t(Text::Description));
-            ui.vertical(|ui| {
+            },
+            |ui| note(ui, Field::Name, name_problem, Text::HelpName),
+        );
+        ui::field(
+            ui,
+            t(Text::Description),
+            |ui| {
                 ui.add(
                     egui::TextEdit::multiline(&mut session.form.description)
                         .desired_rows(2)
                         .desired_width(ui.available_width()),
                 );
-                help(ui, Text::HelpDescription);
-            });
-            ui.end_row();
-        });
+            },
+            |ui| help(ui, Text::HelpDescription),
+        );
+    });
 
-    section(ui, Text::SectionScript);
-    let busy = session.picker.is_some();
-    egui::Grid::new("editor_script")
-        .num_columns(2)
-        .spacing([16.0, 10.0])
-        .show(ui, |ui| {
-            ui.label(t(Text::Script));
-            ui.vertical(|ui| {
+    ui::section(ui, t(Text::SectionScript), Some(t(Text::SectionScriptCaption)), |ui| {
+        let kind = session.form.script_kind();
+        let problem = problem_for(errors, session, Field::ScriptPath);
+        ui::field(
+            ui,
+            t(Text::Script),
+            |ui| {
                 ui.allocate_ui_with_layout(row_size(ui), egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.add_enabled(!busy, egui::Button::new(t(Text::ChooseFile))).clicked() {
                         request = Some(Pick::Script);
@@ -583,30 +589,34 @@ fn form_ui(ui: &mut Ui, session: &mut Session, errors: &[FormError]) -> Option<P
                     );
                     touch_if(&mut session.touched, Field::ScriptPath, response.changed());
                 });
-                match session.form.script_kind() {
+            },
+            |ui| {
+                match kind {
                     Some(kind) => {
                         let text = format!("{} {}", t(Text::DetectedType), t(script_kind_text(kind)));
                         ui.label(RichText::new(text).weak());
                     }
-                    None => problem_label(ui, errors, session, Field::ScriptPath),
+                    None => show_problem(ui, Field::ScriptPath, problem),
                 }
                 help(ui, Text::HelpScript);
-            });
-            ui.end_row();
-
-            ui.label(t(Text::Arguments));
-            ui.vertical(|ui| {
+            },
+        );
+        ui::field(
+            ui,
+            t(Text::Arguments),
+            |ui| {
                 ui.add(
                     egui::TextEdit::multiline(&mut session.form.args)
                         .desired_rows(3)
                         .desired_width(ui.available_width()),
                 );
-                help(ui, Text::HelpArguments);
-            });
-            ui.end_row();
-
-            ui.label(t(Text::Interpreter));
-            ui.vertical(|ui| {
+            },
+            |ui| help(ui, Text::HelpArguments),
+        );
+        ui::field(
+            ui,
+            t(Text::Interpreter),
+            |ui| {
                 ui.allocate_ui_with_layout(row_size(ui), egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.add_enabled(!busy, egui::Button::new(t(Text::ChooseFile))).clicked() {
                         request = Some(Pick::Interpreter);
@@ -615,12 +625,13 @@ fn form_ui(ui: &mut Ui, session: &mut Session, errors: &[FormError]) -> Option<P
                         egui::TextEdit::singleline(&mut session.form.interpreter).desired_width(ui.available_width()),
                     );
                 });
-                help(ui, Text::HelpInterpreter);
-            });
-            ui.end_row();
-
-            ui.label(t(Text::WorkingDir));
-            ui.vertical(|ui| {
+            },
+            |ui| help(ui, Text::HelpInterpreter),
+        );
+        ui::field(
+            ui,
+            t(Text::WorkingDir),
+            |ui| {
                 ui.allocate_ui_with_layout(row_size(ui), egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
                         .add_enabled(!busy, egui::Button::new(t(Text::ChooseFolder)))
@@ -632,49 +643,63 @@ fn form_ui(ui: &mut Ui, session: &mut Session, errors: &[FormError]) -> Option<P
                         egui::TextEdit::singleline(&mut session.form.working_dir).desired_width(ui.available_width()),
                     );
                 });
-                help(ui, Text::HelpWorkingDir);
-            });
-            ui.end_row();
+            },
+            |ui| help(ui, Text::HelpWorkingDir),
+        );
+    });
 
-            ui.label(t(Text::Timeout));
-            ui.vertical(|ui| {
-                ui.horizontal(|ui| {
-                    let response =
-                        ui.add(egui::TextEdit::singleline(&mut session.form.timeout_amount).desired_width(90.0));
-                    touch_if(&mut session.touched, Field::Timeout, response.changed());
-                    let changed = unit_combo(ui, "timeout_unit", &mut session.form.timeout_unit);
-                    touch_if(&mut session.touched, Field::Timeout, changed);
-                });
-                problem_label(ui, errors, session, Field::Timeout);
-                help(ui, Text::HelpTimeout);
-            });
-            ui.end_row();
-        });
+    ui::section(
+        ui,
+        t(Text::SectionExecution),
+        Some(t(Text::SectionExecutionCaption)),
+        |ui| {
+            let problem = problem_for(errors, session, Field::Timeout);
+            ui::field(
+                ui,
+                t(Text::Timeout),
+                |ui| {
+                    ui.horizontal(|ui| {
+                        let response =
+                            ui.add(egui::TextEdit::singleline(&mut session.form.timeout_amount).desired_width(90.0));
+                        touch_if(&mut session.touched, Field::Timeout, response.changed());
+                        let changed = unit_combo(ui, "timeout_unit", &mut session.form.timeout_unit);
+                        touch_if(&mut session.touched, Field::Timeout, changed);
+                    });
+                },
+                |ui| note(ui, Field::Timeout, problem, Text::HelpTimeout),
+            );
+            ui.checkbox(&mut session.form.allow_concurrent, t(Text::AllowConcurrent));
+            help(ui, Text::HelpAllowConcurrent);
+            ui.checkbox(&mut session.form.capture_logs, t(Text::CaptureLogs));
+            help(ui, Text::HelpCaptureLogs);
+            let mut in_user_session = session.form.run_as == RunAs::UserSession;
+            if ui.checkbox(&mut in_user_session, t(Text::RunInUserSession)).changed() {
+                session.form.run_as = if in_user_session {
+                    RunAs::UserSession
+                } else {
+                    RunAs::Service
+                };
+            }
+            help(ui, Text::HelpRunInUserSession);
+        },
+    );
 
-    ui.add_space(6.0);
-    ui.checkbox(&mut session.form.allow_concurrent, t(Text::AllowConcurrent));
-    help(ui, Text::HelpAllowConcurrent);
-    ui.checkbox(&mut session.form.capture_logs, t(Text::CaptureLogs));
-    help(ui, Text::HelpCaptureLogs);
-    let mut in_user_session = session.form.run_as == RunAs::UserSession;
-    if ui.checkbox(&mut in_user_session, t(Text::RunInUserSession)).changed() {
-        session.form.run_as = if in_user_session {
-            RunAs::UserSession
-        } else {
-            RunAs::Service
-        };
-    }
-    help(ui, Text::HelpRunInUserSession);
-
-    section(ui, Text::SectionSchedule);
-    egui::Grid::new("editor_schedule")
-        .num_columns(2)
-        .spacing([16.0, 10.0])
-        .show(ui, |ui| {
-            ui.label(t(Text::ScheduleType));
-            kind_combo(ui, &mut session.form.schedule.kind);
-            ui.end_row();
-
+    ui::section(
+        ui,
+        t(Text::SectionSchedule),
+        Some(t(Text::SectionScheduleCaption)),
+        |ui| {
+            if session.form.schedule.kind != ScheduleKind::None {
+                ui.checkbox(&mut session.form.schedule_enabled, t(Text::ScheduleEnabled));
+                help(ui, Text::HelpScheduleEnabled);
+                ui.add_space(4.0);
+            }
+            ui::field(
+                ui,
+                t(Text::ScheduleType),
+                |ui| kind_combo(ui, &mut session.form.schedule.kind),
+                |_| {},
+            );
             match session.form.schedule.kind {
                 ScheduleKind::None => {}
                 ScheduleKind::Interval => interval_row(ui, session, errors),
@@ -685,80 +710,85 @@ fn form_ui(ui: &mut Ui, session: &mut Session, errors: &[FormError]) -> Option<P
                 }
                 ScheduleKind::Cron => cron_row(ui, session, errors),
             }
-        });
-    if session.form.schedule.kind != ScheduleKind::None {
-        ui.add_space(4.0);
-        ui.checkbox(&mut session.form.schedule_enabled, t(Text::ScheduleEnabled));
-        help(ui, Text::HelpScheduleEnabled);
-    }
-
-    schedule_preview(ui, session);
+            ui.add_space(8.0);
+            schedule_preview(ui, session);
+        },
+    );
     request
 }
 
 fn interval_row(ui: &mut Ui, session: &mut Session, errors: &[FormError]) {
-    ui.label(i18n::t(Common::ScheduleEvery));
-    ui.vertical(|ui| {
-        ui.horizontal(|ui| {
-            let response =
-                ui.add(egui::TextEdit::singleline(&mut session.form.schedule.interval_amount).desired_width(90.0));
-            touch_if(&mut session.touched, Field::ScheduleInterval, response.changed());
-            let changed = unit_combo(ui, "interval_unit", &mut session.form.schedule.interval_unit);
-            touch_if(&mut session.touched, Field::ScheduleInterval, changed);
-        });
-        problem_label(ui, errors, session, Field::ScheduleInterval);
-        help(ui, Text::HelpInterval);
-    });
-    ui.end_row();
+    let problem = problem_for(errors, session, Field::ScheduleInterval);
+    ui::field(
+        ui,
+        i18n::t(Common::ScheduleEvery),
+        |ui| {
+            ui.horizontal(|ui| {
+                let response =
+                    ui.add(egui::TextEdit::singleline(&mut session.form.schedule.interval_amount).desired_width(90.0));
+                touch_if(&mut session.touched, Field::ScheduleInterval, response.changed());
+                let changed = unit_combo(ui, "interval_unit", &mut session.form.schedule.interval_unit);
+                touch_if(&mut session.touched, Field::ScheduleInterval, changed);
+            });
+        },
+        |ui| note(ui, Field::ScheduleInterval, problem, Text::HelpInterval),
+    );
 }
 
 fn time_row(ui: &mut Ui, session: &mut Session, errors: &[FormError]) {
-    ui.label(t(Text::Time));
-    ui.vertical(|ui| {
-        let response = ui.add(egui::TextEdit::singleline(&mut session.form.schedule.time).desired_width(90.0));
-        touch_if(&mut session.touched, Field::ScheduleTime, response.changed());
-        problem_label(ui, errors, session, Field::ScheduleTime);
-        help(ui, Text::HelpTime);
-    });
-    ui.end_row();
+    let problem = problem_for(errors, session, Field::ScheduleTime);
+    ui::field(
+        ui,
+        t(Text::Time),
+        |ui| {
+            let response = ui.add(egui::TextEdit::singleline(&mut session.form.schedule.time).desired_width(90.0));
+            touch_if(&mut session.touched, Field::ScheduleTime, response.changed());
+        },
+        |ui| note(ui, Field::ScheduleTime, problem, Text::HelpTime),
+    );
 }
 
 fn days_row(ui: &mut Ui, session: &mut Session, errors: &[FormError]) {
-    ui.label(t(Text::Days));
-    ui.vertical(|ui| {
-        ui.horizontal(|ui| {
-            for (index, day) in WEEK.iter().enumerate() {
-                let on = session.form.schedule.days[index];
-                let name = i18n::weekday_short(i18n::Lang::default(), *day);
-                // Each day is a widget of its own: the id must differ, even though the names are short.
-                ui.push_id(index, |ui| {
-                    if ui.selectable_label(on, name).clicked() {
-                        session.form.schedule.days[index] = !on;
-                        touch_if(&mut session.touched, Field::ScheduleDays, true);
-                    }
-                });
-            }
-        });
-        problem_label(ui, errors, session, Field::ScheduleDays);
-        help(ui, Text::HelpDays);
-    });
-    ui.end_row();
+    let problem = problem_for(errors, session, Field::ScheduleDays);
+    ui::field(
+        ui,
+        t(Text::Days),
+        |ui| {
+            ui.horizontal(|ui| {
+                for (index, day) in WEEK.iter().enumerate() {
+                    let on = session.form.schedule.days[index];
+                    let name = i18n::weekday_short(i18n::Lang::default(), *day);
+                    // Each day is a widget of its own: the id must differ, even though the names are short.
+                    ui.push_id(index, |ui| {
+                        if ui.selectable_label(on, name).clicked() {
+                            session.form.schedule.days[index] = !on;
+                            touch_if(&mut session.touched, Field::ScheduleDays, true);
+                        }
+                    });
+                }
+            });
+        },
+        |ui| note(ui, Field::ScheduleDays, problem, Text::HelpDays),
+    );
 }
 
 fn cron_row(ui: &mut Ui, session: &mut Session, errors: &[FormError]) {
-    ui.label(t(Text::CronExpr));
-    ui.vertical(|ui| {
-        let response =
-            ui.add(egui::TextEdit::singleline(&mut session.form.schedule.cron).desired_width(ui.available_width()));
-        touch_if(&mut session.touched, Field::ScheduleCron, response.changed());
-        problem_label(ui, errors, session, Field::ScheduleCron);
-        help(ui, Text::HelpCron);
-    });
-    ui.end_row();
+    let problem = problem_for(errors, session, Field::ScheduleCron);
+    ui::field(
+        ui,
+        t(Text::CronExpr),
+        |ui| {
+            let response =
+                ui.add(egui::TextEdit::singleline(&mut session.form.schedule.cron).desired_width(ui.available_width()));
+            touch_if(&mut session.touched, Field::ScheduleCron, response.changed());
+        },
+        |ui| note(ui, Field::ScheduleCron, problem, Text::HelpCron),
+    );
 }
 
+/// The next runs, as a muted list at the end of the schedule.
 fn schedule_preview(ui: &mut Ui, session: &mut Session) {
-    section(ui, Text::SectionPreview);
+    ui.label(RichText::new(t(Text::SectionPreview)).strong());
     if session.form.schedule.kind == ScheduleKind::None {
         ui.label(RichText::new(t(Text::PreviewNone)).weak());
         return;
@@ -768,7 +798,7 @@ fn schedule_preview(ui: &mut Ui, session: &mut Session) {
         ui.label(RichText::new(t(Text::PreviewInvalid)).weak());
     } else {
         for run in runs {
-            ui.label(fmt::date_time_local(run));
+            ui.label(RichText::new(fmt::date_time_local(run)).weak());
         }
     }
 }
@@ -812,22 +842,27 @@ fn unit_combo(ui: &mut Ui, id: &str, unit: &mut TimeUnit) -> bool {
     *unit != before
 }
 
-fn section(ui: &mut Ui, text: Text) {
-    ui.add_space(8.0);
-    ui.label(RichText::new(t(text)).strong());
-    ui.separator();
+/// The problem to show under `field`, as the form stands now.
+fn problem_for(errors: &[FormError], session: &Session, field: Field) -> Option<Problem> {
+    visible_problem(errors, field, session.attempted, &session.touched)
+}
+
+/// The problem under a field, in red, if there is one.
+fn show_problem(ui: &mut Ui, field: Field, problem: Option<Problem>) {
+    if let Some(problem) = problem {
+        let color = theme::tone_color(Tone::Bad, ui.visuals().dark_mode);
+        ui.label(RichText::new(t(problem_text(field, problem))).color(color));
+    }
+}
+
+/// The problem under a field (if there is one), then the field's help line.
+fn note(ui: &mut Ui, field: Field, problem: Option<Problem>, text: Text) {
+    show_problem(ui, field, problem);
+    help(ui, text);
 }
 
 fn help(ui: &mut Ui, text: Text) {
     ui.label(RichText::new(t(text)).weak().small());
-}
-
-/// The problem under a field, in red, if one is visible.
-fn problem_label(ui: &mut Ui, errors: &[FormError], session: &Session, field: Field) {
-    if let Some(problem) = visible_problem(errors, field, session.attempted, &session.touched) {
-        let color = theme::tone_color(Tone::Bad, ui.visuals().dark_mode);
-        ui.label(RichText::new(t(problem_text(field, problem))).color(color));
-    }
 }
 
 fn touch_if(touched: &mut Vec<Field>, field: Field, changed: bool) {
@@ -970,6 +1005,7 @@ mod tests {
         frames: usize,
     ) -> Vec<f32> {
         let ctx = egui::Context::default();
+        theme::apply_style(&ctx);
         let mut widths = Vec::new();
         for _ in 0..frames {
             let input = egui::RawInput {
@@ -1015,6 +1051,7 @@ mod tests {
         frames: usize,
     ) -> Vec<f32> {
         let ctx = egui::Context::default();
+        theme::apply_style(&ctx);
         let mut heights = Vec::new();
         for _ in 0..frames {
             let input = egui::RawInput {

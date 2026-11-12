@@ -16,7 +16,7 @@ use eframe::egui::{self, RichText, TextStyle};
 use scriptrunner_core::logs::{LogEntry, LogKind};
 use scriptrunner_core::{Execution, ExecutionId, ExecutionStatus};
 
-use super::{Outcome, theme};
+use super::{Outcome, theme, ui};
 use crate::backend::{Action, Command, Failure};
 use crate::fmt::{self, Tone};
 use crate::i18n::log_view::{Text, t};
@@ -52,17 +52,31 @@ impl LogScreen {
         self.poll_export(&mut outcome);
         let connected = state.is_connected();
 
+        // The page keeps the log clear of the window's edges; the log itself fills the rest.
+        let retry = ui::page(ui, ui::FULL_WIDTH, |ui| {
+            self.contents(ui, state, connected, &mut outcome)
+        });
+        if retry {
+            for command in state.retry_log() {
+                outcome.send(command);
+            }
+        }
+        outcome
+    }
+
+    /// The screen's contents. Returns `true` when the user asks to retry following the log.
+    fn contents(&mut self, ui: &mut egui::Ui, state: &mut AppState, connected: bool, outcome: &mut Outcome) -> bool {
         let Some(log) = state.log.as_mut() else {
-            ui.heading(t(Text::Title));
+            ui::header(ui, t(Text::Title), None, |_| {});
             ui.label(t(Text::NoExecutionOpen));
             if ui.button(t(Text::Back)).clicked() {
                 outcome.goto(Screen::History);
             }
-            return outcome;
+            return false;
         };
 
         let now = Utc::now();
-        self.actions(ui, log, connected, &mut outcome);
+        self.actions(ui, log, connected, outcome);
         match &log.execution {
             Some(execution) => header(ui, execution, now),
             None if !log.missing => {
@@ -95,13 +109,7 @@ impl LogScreen {
             // The clock of a running execution only moves when the screen is drawn again.
             ui.ctx().request_repaint_after(CLOCK_TICK);
         }
-
-        if retry {
-            for command in state.retry_log() {
-                outcome.send(command);
-            }
-        }
-        outcome
+        retry
     }
 
     /// On the first frame for an execution, or after another one was opened, starts this screen's own
