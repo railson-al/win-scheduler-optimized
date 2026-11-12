@@ -155,3 +155,7 @@ de Windows fica atrás de `cfg(windows)`; para checá-lo:
 rustup target add x86_64-pc-windows-gnu
 cargo check -p scriptrunner-core --target x86_64-pc-windows-gnu --all-targets
 ```
+
+O `Makefile` reúne esses comandos. `make` lista os alvos; os principais são `make ci` (formatação, clippy no
+Linux e no código Windows, e testes, como o CI), `make daemon` e `make sr ARGS="list"` (daemon e CLI com uma
+pasta de dados de desenvolvimento), `make gui` e `make windows-steps` (imprime a sequência para testar no Windows).
