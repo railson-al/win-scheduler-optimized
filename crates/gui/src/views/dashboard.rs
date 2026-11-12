@@ -191,7 +191,9 @@ impl DashboardView {
 /// The rows. A delete request is stored in memory, not sent: the confirmation dialog sends it.
 fn table(ui: &mut egui::Ui, outcome: &mut Outcome, rows: &[&TaskOverview], connected: bool) {
     let mut asked_delete = None;
-    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+    // Both directions: the row of actions alone is wider than a small window, and a table cut at the window's
+    // edge with no way to scroll to it would hide the buttons.
+    egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
         egui::Grid::new("dashboard_tasks")
             .striped(true)
             .spacing([18.0, 8.0])

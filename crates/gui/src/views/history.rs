@@ -205,7 +205,9 @@ impl HistoryView {
         // fills whatever is left.
         pages_footer(ui, state, &mut outcome);
         banner_line(ui, state);
-        egui::ScrollArea::vertical().show(ui, |ui| table(ui, state, &mut outcome));
+        // Both directions: a long task name or failure reason makes the table wider than the window, and it
+        // must stay reachable.
+        egui::ScrollArea::both().show(ui, |ui| table(ui, state, &mut outcome));
         clear_dialog(ui.ctx(), &mut memo, &mut outcome);
 
         ui.ctx().data_mut(|data| data.insert_temp(memo_id, memo));

@@ -29,6 +29,9 @@ pub mod theme;
 #[cfg(test)]
 pub mod testing;
 
+#[cfg(test)]
+mod layout;
+
 /// What a screen asks the shell to do after a frame.
 #[derive(Debug, Default)]
 pub struct Outcome {

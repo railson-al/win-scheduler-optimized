@@ -532,7 +532,8 @@ fn form_ui(ui: &mut Ui, session: &mut Session, errors: &[FormError]) -> Option<P
         .show(ui, |ui| {
             ui.label(t(Text::Name));
             ui.vertical(|ui| {
-                let response = ui.add(egui::TextEdit::singleline(&mut session.form.name).desired_width(f32::INFINITY));
+                let response =
+                    ui.add(egui::TextEdit::singleline(&mut session.form.name).desired_width(ui.available_width()));
                 touch_if(&mut session.touched, Field::Name, response.changed());
                 problem_label(ui, errors, session, Field::Name);
                 help(ui, Text::HelpName);
@@ -544,7 +545,7 @@ fn form_ui(ui: &mut Ui, session: &mut Session, errors: &[FormError]) -> Option<P
                 ui.add(
                     egui::TextEdit::multiline(&mut session.form.description)
                         .desired_rows(2)
-                        .desired_width(f32::INFINITY),
+                        .desired_width(ui.available_width()),
                 );
                 help(ui, Text::HelpDescription);
             });
@@ -563,8 +564,9 @@ fn form_ui(ui: &mut Ui, session: &mut Session, errors: &[FormError]) -> Option<P
                     if ui.add_enabled(!busy, egui::Button::new(t(Text::ChooseFile))).clicked() {
                         request = Some(Pick::Script);
                     }
-                    let response =
-                        ui.add(egui::TextEdit::singleline(&mut session.form.script_path).desired_width(f32::INFINITY));
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut session.form.script_path).desired_width(ui.available_width()),
+                    );
                     touch_if(&mut session.touched, Field::ScriptPath, response.changed());
                 });
                 match session.form.script_kind() {
@@ -583,7 +585,7 @@ fn form_ui(ui: &mut Ui, session: &mut Session, errors: &[FormError]) -> Option<P
                 ui.add(
                     egui::TextEdit::multiline(&mut session.form.args)
                         .desired_rows(3)
-                        .desired_width(f32::INFINITY),
+                        .desired_width(ui.available_width()),
                 );
                 help(ui, Text::HelpArguments);
             });
@@ -595,7 +597,9 @@ fn form_ui(ui: &mut Ui, session: &mut Session, errors: &[FormError]) -> Option<P
                     if ui.add_enabled(!busy, egui::Button::new(t(Text::ChooseFile))).clicked() {
                         request = Some(Pick::Interpreter);
                     }
-                    ui.add(egui::TextEdit::singleline(&mut session.form.interpreter).desired_width(f32::INFINITY));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut session.form.interpreter).desired_width(ui.available_width()),
+                    );
                 });
                 help(ui, Text::HelpInterpreter);
             });
@@ -610,7 +614,9 @@ fn form_ui(ui: &mut Ui, session: &mut Session, errors: &[FormError]) -> Option<P
                     {
                         request = Some(Pick::WorkingDir);
                     }
-                    ui.add(egui::TextEdit::singleline(&mut session.form.working_dir).desired_width(f32::INFINITY));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut session.form.working_dir).desired_width(ui.available_width()),
+                    );
                 });
                 help(ui, Text::HelpWorkingDir);
             });
@@ -719,7 +725,8 @@ fn days_row(ui: &mut Ui, session: &mut Session, errors: &[FormError]) {
 fn cron_row(ui: &mut Ui, session: &mut Session, errors: &[FormError]) {
     ui.label(t(Text::CronExpr));
     ui.vertical(|ui| {
-        let response = ui.add(egui::TextEdit::singleline(&mut session.form.schedule.cron).desired_width(f32::INFINITY));
+        let response =
+            ui.add(egui::TextEdit::singleline(&mut session.form.schedule.cron).desired_width(ui.available_width()));
         touch_if(&mut session.touched, Field::ScheduleCron, response.changed());
         problem_label(ui, errors, session, Field::ScheduleCron);
         help(ui, Text::HelpCron);
@@ -927,6 +934,67 @@ mod tests {
         });
         output.textures_delta.clear();
         outcome
+    }
+
+    // ---- layout ----
+
+    /// Draws the editor `frames` times in a window of a fixed size, the way the shell does (inside a
+    /// central panel), and returns the width the screen used after each frame.
+    fn widths_over_time(
+        view: &mut TaskEditorView,
+        state: &mut AppState,
+        window: egui::Vec2,
+        frames: usize,
+    ) -> Vec<f32> {
+        let ctx = egui::Context::default();
+        let mut widths = Vec::new();
+        for _ in 0..frames {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, window)),
+                ..egui::RawInput::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| view.show(ui, state));
+            });
+            output.textures_delta.clear();
+            widths.push(ctx.globally_used_rect().width());
+        }
+        widths
+    }
+
+    /// A field that asks for "all the width there is" inside a grid inside a scroll area makes the grid
+    /// remember a wider column each frame, so the form grows until a horizontal scrollbar appears and keeps
+    /// growing. Seen on Windows: the script box kept widening and could not be used.
+    #[test]
+    fn the_form_never_grows_wider_than_the_window_however_many_frames_are_drawn() {
+        for (name, mut state) in [("new", creating()), ("existing", editing(valid_task()))] {
+            let mut view = TaskEditorView::default();
+            let window = egui::vec2(900.0, 700.0);
+            let widths = widths_over_time(&mut view, &mut state, window, 15);
+            let last = widths[widths.len() - 1];
+            assert!(
+                widths.iter().all(|width| *width <= window.x + 0.5),
+                "the {name} form outgrew a {} px window: {widths:?}",
+                window.x
+            );
+            assert!(
+                (widths[widths.len() - 2] - last).abs() < 0.5,
+                "the {name} form was still changing width after 15 frames: {widths:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_form_also_fits_a_narrow_window() {
+        let mut view = TaskEditorView::default();
+        let mut state = creating();
+        let window = egui::vec2(480.0, 600.0);
+        let widths = widths_over_time(&mut view, &mut state, window, 15);
+        assert!(
+            widths.iter().all(|width| *width <= window.x + 0.5),
+            "the form outgrew a {} px window: {widths:?}",
+            window.x
+        );
     }
 
     // ---- (a) which task the editor shows ----
