@@ -161,6 +161,20 @@ fn the_settings_fit_every_window() {
     }
 }
 
+/// The task editor has no sideways scroll, so it must fit every window. (Its height is checked in its own
+/// tests: it has to be measured inside its own scroll area, which only it can see.)
+#[test]
+fn the_editor_fits_every_window_and_stops_growing() {
+    for data in [Data::Typical, Data::Extreme] {
+        let mut state = crowded_state(data);
+        state.screen = Screen::TaskEditor { task: None };
+        let mut view: super::editor::TaskEditorView = Default::default();
+        check("the editor", Some(0.0), |ui, _| {
+            view.show(ui, &mut state);
+        });
+    }
+}
+
 /// The log scrolls sideways on purpose (a line can be longer than the window), so only settling counts.
 #[test]
 fn the_log_settles_whatever_its_lines_say() {

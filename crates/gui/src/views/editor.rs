@@ -51,6 +51,9 @@ struct Session {
     last_notice: u64,
     preview: Option<Preview>,
     confirm_discard: bool,
+    /// How tall the form was in the last frame. Not used to draw: tests read it, because a form whose height
+    /// keeps growing is a layout fault that no other number shows.
+    content_height: f32,
 }
 
 impl Session {
@@ -68,6 +71,7 @@ impl Session {
             picker: None,
             saving: None,
             save_error: None,
+            content_height: 0.0,
             last_notice,
             preview: None,
             confirm_discard: false,
@@ -339,10 +343,11 @@ fn draw(ui: &mut Ui, session: &mut Session, state: &AppState, outcome: &mut Outc
         .show(ui, |ui| actions(ui, session, state, errors.is_empty()))
         .inner;
 
-    let request = egui::ScrollArea::vertical()
+    let area = egui::ScrollArea::vertical()
         .auto_shrink([false, false])
-        .show(ui, |ui| form_ui(ui, session, &errors))
-        .inner;
+        .show(ui, |ui| form_ui(ui, session, &errors));
+    session.content_height = area.content_size.y;
+    let request = area.inner;
     if let Some(pick) = request
         && session.picker.is_none()
     {
@@ -516,6 +521,15 @@ fn actions(ui: &mut Ui, session: &Session, state: &AppState, valid: bool) -> Cli
     clicks
 }
 
+/// The room for a row made of a text field with a button on its right: all the width, one button tall.
+///
+/// The height matters. A `right_to_left` layout with `Align::Center` asked for directly takes all the height
+/// that is left, and a scroll area has none that ends: the row, then the form, grew taller every frame
+/// (seen on Windows). Giving the layout a rectangle of a button's height keeps it a row.
+fn row_size(ui: &Ui) -> egui::Vec2 {
+    egui::vec2(ui.available_width(), ui.spacing().interact_size.y)
+}
+
 /// Draws the form. Returns the file dialog the user asked for, if any.
 fn form_ui(ui: &mut Ui, session: &mut Session, errors: &[FormError]) -> Option<Pick> {
     let mut request = None;
@@ -560,7 +574,7 @@ fn form_ui(ui: &mut Ui, session: &mut Session, errors: &[FormError]) -> Option<P
         .show(ui, |ui| {
             ui.label(t(Text::Script));
             ui.vertical(|ui| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.allocate_ui_with_layout(row_size(ui), egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.add_enabled(!busy, egui::Button::new(t(Text::ChooseFile))).clicked() {
                         request = Some(Pick::Script);
                     }
@@ -593,7 +607,7 @@ fn form_ui(ui: &mut Ui, session: &mut Session, errors: &[FormError]) -> Option<P
 
             ui.label(t(Text::Interpreter));
             ui.vertical(|ui| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.allocate_ui_with_layout(row_size(ui), egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.add_enabled(!busy, egui::Button::new(t(Text::ChooseFile))).clicked() {
                         request = Some(Pick::Interpreter);
                     }
@@ -607,7 +621,7 @@ fn form_ui(ui: &mut Ui, session: &mut Session, errors: &[FormError]) -> Option<P
 
             ui.label(t(Text::WorkingDir));
             ui.vertical(|ui| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.allocate_ui_with_layout(row_size(ui), egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
                         .add_enabled(!busy, egui::Button::new(t(Text::ChooseFolder)))
                         .clicked()
@@ -980,6 +994,55 @@ mod tests {
             assert!(
                 (widths[widths.len() - 2] - last).abs() < 0.5,
                 "the {name} form was still changing width after 15 frames: {widths:?}"
+            );
+        }
+    }
+
+    /// The height of the form after each of `frames` frames drawn in one context.
+    fn heights_over_time(
+        view: &mut TaskEditorView,
+        state: &mut AppState,
+        window: egui::Vec2,
+        frames: usize,
+    ) -> Vec<f32> {
+        let ctx = egui::Context::default();
+        let mut heights = Vec::new();
+        for _ in 0..frames {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, window)),
+                ..egui::RawInput::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| view.show(ui, state));
+            });
+            output.textures_delta.clear();
+            heights.push(view.session.as_ref().map_or(0.0, |session| session.content_height));
+        }
+        heights
+    }
+
+    /// A `right_to_left` layout asked for directly in a cell of a scroll area takes all the height that is
+    /// left, and in a scroll area that has no end: the form got taller every frame and its middle went blank
+    /// (seen on Windows, in the script section). Every row must have the height of its widgets.
+    #[test]
+    fn the_form_has_a_finite_height_that_stops_changing() {
+        for (name, mut state) in [("new", creating()), ("existing", editing(valid_task()))] {
+            let mut view = TaskEditorView::default();
+            let heights = heights_over_time(&mut view, &mut state, egui::vec2(900.0, 700.0), 15);
+            let last = heights[heights.len() - 1];
+            assert!(
+                (heights[heights.len() - 2] - last).abs() < 0.5,
+                "the {name} form was still changing height after 15 frames: {heights:?}"
+            );
+            // The whole form is a few dozen rows. Anything near a screenful of screens is runaway growth,
+            // and anything very short means the rows collapsed.
+            assert!(
+                last < 2_500.0,
+                "the {name} form is absurdly tall ({last} px): {heights:?}"
+            );
+            assert!(
+                last > 400.0,
+                "the {name} form is too short to hold its fields ({last} px)"
             );
         }
     }
