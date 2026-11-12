@@ -66,16 +66,25 @@ mod imp {
 
     impl ProcessTree {
         pub fn attach(child: &Child) -> Self {
+            match child.raw_handle() {
+                Some(process) => Self::attach_raw(process as HANDLE),
+                None => Self {
+                    job: std::ptr::null_mut(),
+                },
+            }
+        }
+
+        /// Tracks a process that did not come from `tokio::process`: the one started in the logged-on user's
+        /// session. `process` must stay open until this call returns; the job does not keep it open.
+        pub fn attach_raw(process: HANDLE) -> Self {
             // SAFETY: FFI calls with valid (or null, where allowed) arguments;
             // the handle we create is owned by `Self` and closed in `Drop`.
             unsafe {
                 let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-                if !job.is_null()
-                    && let Some(process) = child.raw_handle()
-                {
+                if !job.is_null() {
                     // Failure is tolerated: the executor still kills the
                     // main process directly as a fallback.
-                    AssignProcessToJobObject(job, process as HANDLE);
+                    AssignProcessToJobObject(job, process);
                 }
                 Self { job }
             }

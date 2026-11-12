@@ -353,7 +353,62 @@ Pontos que ficaram para decidir ou medir:
 - **Seletor de arquivo no Linux** pode exigir a thread principal em alguns backends; o alvo é o Windows, onde o
   diálogo Win32 deve funcionar numa thread, mas isso não foi verificado.
 
+### Executar na sessão do usuário (`RunAs::UserSession`): código pronto, falta rodar no Windows
+
+Nasceu de um teste real: um robô com `headless=False` rodava pelo ScriptRunner, o log mostrava a execução, e nenhum
+navegador aparecia. O serviço é LocalSystem na **sessão 0**, que desde o Vista não tem área de trabalho: o navegador
+abre numa tela invisível, e o script ainda vê o perfil do SYSTEM (sem OneDrive, sem unidades mapeadas, sem logins
+salvos do usuário). Já constava como limitação conhecida da Leva 2.
+
+- **Modelo:** `Task.run_as` (`Service`, o padrão, ou `UserSession`), com `serde(default)`: clientes e bancos antigos
+  continuam valendo como `Service`. O banco ganhou a migração 2 (`ALTER TABLE tasks ADD COLUMN run_as TEXT NOT NULL
+  DEFAULT 'service'`), testada contra uma base de versão 1. O protocolo **não** subiu de versão (campo opcional);
+  uma GUI nova falando com um daemon antigo gravaria a tarefa sem o campo, em silêncio.
+- **Executor** (`core/executor/interactive.rs`, só Windows): acha a sessão do usuário (console, ou uma sessão RDP
+  ativa), pega o token (`WTSQueryUserToken`), troca o token elevado de um administrador pelo **limitado** (o que um
+  duplo clique daria: unidades de rede mapeadas e o comportamento esperado de navegadores), lê o ambiente do usuário,
+  resolve o programa no `PATH` **dele** (o serviço procuraria no `PATH` do sistema), monta a linha de comando (`.bat`
+  e `.cmd` por `cmd /d /s /c`, recusando argumentos com `"`, `%` ou quebra de linha), cria os canos de saída com uma
+  **lista explícita de handles herdados** (stdin em `NUL`, os dois canos), inicia suspenso em `winsta0\default`, põe
+  num Job Object (o "Parar" mata a árvore) e retoma. Sem ninguém logado, a execução **falha** com um motivo claro
+  em vez de rodar escondida.
+- **Parte pura testada no Linux** (`executor/winlaunch.rs`, 12 testes): aspas no formato do `CreateProcess`, linha de
+  comando de `.bat`, leitura e montagem do bloco de ambiente, busca do programa no `PATH` com `PATHEXT`.
+- **Motor e CLI:** `executor::spawn_as(task.run_as, ..)`; o log diz `started (in the user's session): ...`;
+  `scriptrunner add ... --user-session`. **GUI:** caixa "Executar na sessão do usuário logado (janela visível)" no
+  editor, com a explicação.
+- **Verificado:** fmt, `clippy -D warnings` no Linux e no alvo Windows (o `unsafe` passa na checagem de tipos),
+  58 testes do `core`, 14 do `storage`, 188 do `gui`. **Não verificado: nada disso foi executado no Windows.**
+  Pontos em que eu apostaria que aparecem problemas: privilégios do `CreateProcessAsUserW` no serviço, a obtenção do
+  token limitado, a lista de handles herdados, a leitura dos canos (feita por threads de bloqueio do tokio) e o
+  `PATH`/`ComSpec` do usuário.
+- **Limites conhecidos:** exige usuário logado (sessão ativa; tela bloqueada conta como ativa, e o navegador abre
+  atrás da tela de bloqueio); com vários usuários, vale o do console; um processo-neto que segura o cano de saída
+  (um navegador deixado aberto) mantém uma thread de leitura presa até ele fechar; não há seletor de usuário nem
+  credencial própria (a tarefa roda como quem estiver logado).
+
+**Como testar no Windows** (o serviço precisa ser reinstalado para pegar o executável novo):
+
+```powershell
+# PowerShell como Administrador, na pasta do projeto
+git pull
+cargo build --workspace
+.\target\debug\scriptrunner.exe service stop
+.\target\debug\scriptrunner.exe service uninstall
+.\target\debug\scriptrunner.exe service install
+.\target\debug\scriptrunner.exe service start
+```
+
+Depois, no PowerShell **sem** elevação, com você logado, uma tarefa de teste que só abre o bloco de notas:
+
+```powershell
+.\target\debug\scriptrunner.exe add "Bloco" "C:\Windows\System32\notepad.exe" --user-session
+.\target\debug\scriptrunner.exe run Bloco
+```
+
+O Bloco de Notas deve aparecer na sua tela. Em seguida, o robô real, marcando a caixa no editor da GUI.
+
 ## Fora desta leva
 
-Ícone de bandeja e notificações, instalador MSI, "executar como usuário", tema escuro e atalhos extras, importar e
+Ícone de bandeja e notificações, instalador MSI, escolher o usuário ou guardar credencial para "executar como", tema escuro e atalhos extras, importar e
 exportar tarefas, tradução para inglês (a estrutura fica pronta), benchmarks (fase 4) e Event Log.

@@ -49,6 +49,8 @@ pub enum Text {
     HelpAllowConcurrent,
     CaptureLogs,
     HelpCaptureLogs,
+    RunInUserSession,
+    HelpRunInUserSession,
     ScheduleEnabled,
     HelpScheduleEnabled,
 
@@ -155,6 +157,13 @@ fn pt_br(key: Text) -> &'static str {
         Text::HelpAllowConcurrent => "Desmarcado: a tarefa não roda duas vezes ao mesmo tempo.",
         Text::CaptureLogs => "Guardar logs",
         Text::HelpCaptureLogs => "Guarda a saída de cada execução para consulta no histórico.",
+        Text::RunInUserSession => "Executar na sessão do usuário logado (janela visível)",
+        Text::HelpRunInUserSession => {
+            "Marque para scripts que abrem janelas (um navegador com headless desligado, por exemplo) ou que \
+             precisam do perfil do usuário: OneDrive, unidades de rede, logins salvos. Exige alguém logado \
+             quando a tarefa disparar; sem isso a execução falha. Desmarcado, roda em segundo plano como o \
+             serviço, mesmo sem ninguém logado, mas sem janela visível."
+        }
         Text::ScheduleEnabled => "Agenda ativa",
         Text::HelpScheduleEnabled => "Desmarcada, a agenda fica pausada e a tarefa roda só manualmente.",
 

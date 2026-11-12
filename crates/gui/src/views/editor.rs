@@ -9,7 +9,7 @@ use std::sync::mpsc::{self, TryRecvError};
 
 use chrono::{DateTime, Local, TimeZone, Timelike, Utc};
 use eframe::egui::{self, Id, RichText, Ui};
-use scriptrunner_core::{ScriptKind, TaskId};
+use scriptrunner_core::{RunAs, ScriptKind, TaskId};
 
 use super::{Outcome, theme};
 use crate::backend::{Action, Command, Failure};
@@ -656,6 +656,15 @@ fn form_ui(ui: &mut Ui, session: &mut Session, errors: &[FormError]) -> Option<P
     help(ui, Text::HelpAllowConcurrent);
     ui.checkbox(&mut session.form.capture_logs, t(Text::CaptureLogs));
     help(ui, Text::HelpCaptureLogs);
+    let mut in_user_session = session.form.run_as == RunAs::UserSession;
+    if ui.checkbox(&mut in_user_session, t(Text::RunInUserSession)).changed() {
+        session.form.run_as = if in_user_session {
+            RunAs::UserSession
+        } else {
+            RunAs::Service
+        };
+    }
+    help(ui, Text::HelpRunInUserSession);
 
     section(ui, Text::SectionSchedule);
     egui::Grid::new("editor_schedule")

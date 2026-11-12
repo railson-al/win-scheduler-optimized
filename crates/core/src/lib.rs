@@ -16,6 +16,7 @@ pub mod schedule;
 
 pub use errors::{CoreError, Result};
 pub use models::{
-    Execution, ExecutionId, ExecutionQuery, ExecutionStatus, ScriptKind, Settings, Task, TaskId, TaskOverview, Trigger,
+    Execution, ExecutionId, ExecutionQuery, ExecutionStatus, RunAs, ScriptKind, Settings, Task, TaskId, TaskOverview,
+    Trigger,
 };
 pub use schedule::Schedule;

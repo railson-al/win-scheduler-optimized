@@ -11,7 +11,7 @@ use std::sync::{Mutex, MutexGuard};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, Row, ToSql, params};
 use scriptrunner_core::{
-    CoreError, Execution, ExecutionId, ExecutionStatus, Schedule, ScriptKind, Settings, Task, TaskId, Trigger,
+    CoreError, Execution, ExecutionId, ExecutionStatus, RunAs, Schedule, ScriptKind, Settings, Task, TaskId, Trigger,
 };
 use thiserror::Error;
 
@@ -35,7 +35,8 @@ pub enum StorageError {
 pub type Result<T> = std::result::Result<T, StorageError>;
 
 /// Each entry migrates the schema from version `index` to `index + 1`.
-const MIGRATIONS: &[&str] = &[r#"
+const MIGRATIONS: &[&str] = &[
+    r#"
 CREATE TABLE tasks (
     id               TEXT PRIMARY KEY,
     name             TEXT NOT NULL,
@@ -81,7 +82,12 @@ CREATE TABLE settings (
     key        TEXT PRIMARY KEY,
     value_json TEXT NOT NULL
 );
-"#];
+"#,
+    // 2: where the task's script runs (see `RunAs`). Existing tasks keep running as the service.
+    r#"
+ALTER TABLE tasks ADD COLUMN run_as TEXT NOT NULL DEFAULT 'service';
+"#,
+];
 
 /// A schedule's stored next slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,8 +156,8 @@ impl Storage {
         tx.execute(
             "INSERT INTO tasks (id, name, description, script_path, script_kind, working_dir,
                                 args_json, interpreter, timeout_secs, allow_concurrent,
-                                capture_logs, created_at, updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                                capture_logs, created_at, updated_at, run_as)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             params![
                 task.id.as_str(),
                 task.name,
@@ -166,6 +172,7 @@ impl Storage {
                 task.capture_logs,
                 ts(task.created_at),
                 ts(task.updated_at),
+                task.run_as.as_str(),
             ],
         )?;
         write_schedule(&tx, task, next_run)?;
@@ -180,7 +187,7 @@ impl Storage {
         let changed = tx.execute(
             "UPDATE tasks SET name=?2, description=?3, script_path=?4, script_kind=?5,
                     working_dir=?6, args_json=?7, interpreter=?8, timeout_secs=?9,
-                    allow_concurrent=?10, capture_logs=?11, updated_at=?12
+                    allow_concurrent=?10, capture_logs=?11, updated_at=?12, run_as=?13
              WHERE id=?1",
             params![
                 task.id.as_str(),
@@ -195,6 +202,7 @@ impl Storage {
                 task.allow_concurrent,
                 task.capture_logs,
                 ts(task.updated_at),
+                task.run_as.as_str(),
             ],
         )?;
         if changed == 0 {
@@ -478,7 +486,7 @@ impl Storage {
 
 const TASK_SELECT: &str = "SELECT t.id, t.name, t.description, t.script_path, t.script_kind,
         t.working_dir, t.args_json, t.interpreter, t.timeout_secs, t.allow_concurrent,
-        t.capture_logs, t.created_at, t.updated_at, s.spec_json, s.enabled
+        t.capture_logs, t.created_at, t.updated_at, s.spec_json, s.enabled, t.run_as
     FROM tasks t LEFT JOIN schedules s ON s.task_id = t.id";
 
 const EXEC_SELECT: &str = "SELECT id, task_id, task_name, trigger, scheduled_for, created_at,
@@ -551,6 +559,7 @@ fn task_from_row(r: &Row<'_>) -> rusqlite::Result<Result<Task>> {
     let updated_at: String = r.get(12)?;
     let spec_json: Option<String> = r.get(13)?;
     let enabled: Option<bool> = r.get(14)?;
+    let run_as: String = r.get(15)?;
 
     Ok((|| {
         Ok(Task {
@@ -567,6 +576,7 @@ fn task_from_row(r: &Row<'_>) -> rusqlite::Result<Result<Task>> {
             timeout_secs: timeout_secs.map(|s| s.max(0) as u64),
             allow_concurrent,
             capture_logs,
+            run_as: RunAs::from_str(&run_as)?,
             created_at: parse_ts(&created_at)?,
             updated_at: parse_ts(&updated_at)?,
         })
@@ -671,6 +681,51 @@ mod tests {
         assert!(!loaded.schedule_enabled);
         assert_eq!(loaded.timeout_secs, Some(30));
         assert_eq!(db.next_run_of(&task.id).unwrap(), Some(at(0, 10)));
+    }
+
+    #[test]
+    fn where_a_task_runs_is_stored_and_can_be_changed() {
+        let db = Storage::open_in_memory().unwrap();
+        let mut task = Task::new("Robô", "/jobs/a.bat");
+        assert_eq!(task.run_as, RunAs::Service);
+        task.run_as = RunAs::UserSession;
+        db.insert_task(&task, None).unwrap();
+        assert_eq!(db.get_task(&task.id).unwrap().unwrap().run_as, RunAs::UserSession);
+
+        task.run_as = RunAs::Service;
+        db.update_task(&task, None).unwrap();
+        assert_eq!(db.get_task(&task.id).unwrap().unwrap().run_as, RunAs::Service);
+    }
+
+    /// A database written before `run_as` existed (schema version 1) is migrated in place, and its tasks keep
+    /// running as the service, exactly as they did.
+    #[test]
+    fn tasks_from_a_version_1_database_run_as_the_service_after_migrating() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(MIGRATIONS[0]).unwrap();
+            conn.execute_batch("PRAGMA user_version = 1").unwrap();
+            conn.execute(
+                "INSERT INTO tasks (id, name, description, script_path, script_kind, working_dir, args_json,
+                                    interpreter, timeout_secs, allow_concurrent, capture_logs, created_at, updated_at)
+                 VALUES ('old', 'Antiga', NULL, '/jobs/a.py', 'python', NULL, '[]', NULL, NULL, 0, 1,
+                         '2025-06-09T00:00:00Z', '2025-06-09T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let db = Storage::open(&path).unwrap();
+        let loaded = db.get_task(&TaskId::from("old".to_owned())).unwrap().unwrap();
+        assert_eq!(loaded.name, "Antiga");
+        assert_eq!(loaded.run_as, RunAs::Service);
+        // And it can be changed afterwards.
+        let mut task = loaded;
+        task.run_as = RunAs::UserSession;
+        db.update_task(&task, None).unwrap();
+        assert_eq!(db.get_task(&task.id).unwrap().unwrap().run_as, RunAs::UserSession);
     }
 
     #[test]

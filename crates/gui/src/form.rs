@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use chrono::{DateTime, NaiveTime, TimeZone, Utc, Weekday};
-use scriptrunner_core::{Schedule, ScriptKind, Task};
+use scriptrunner_core::{RunAs, Schedule, ScriptKind, Task};
 
 /// Days in the order the editor lists them.
 pub const WEEK: [Weekday; 7] = [
@@ -259,6 +259,8 @@ pub struct TaskForm {
     pub timeout_unit: TimeUnit,
     pub allow_concurrent: bool,
     pub capture_logs: bool,
+    /// Where the script runs: as the service, or in the logged-on user's session (visible windows).
+    pub run_as: RunAs,
     pub schedule_enabled: bool,
     pub schedule: ScheduleForm,
     /// The task being edited, `None` for a new one. What the form does not show (id, creation time) is
@@ -304,6 +306,7 @@ impl TaskForm {
             timeout_unit,
             allow_concurrent: task.allow_concurrent,
             capture_logs: task.capture_logs,
+            run_as: task.run_as,
             schedule_enabled: task.schedule_enabled,
             schedule: ScheduleForm::from_schedule(task.schedule.as_ref()),
             base,
@@ -409,6 +412,7 @@ impl TaskForm {
         task.timeout_secs = timeout_secs;
         task.allow_concurrent = self.allow_concurrent;
         task.capture_logs = self.capture_logs;
+        task.run_as = self.run_as;
         task.schedule_enabled = self.schedule_enabled;
         task.schedule = schedule;
         task.updated_at = now;
@@ -516,6 +520,8 @@ mod tests {
         assert_eq!(task.script_kind, ScriptKind::Python);
         assert_eq!(task.schedule, None);
         assert!(task.capture_logs && !task.allow_concurrent && task.schedule_enabled);
+        // Runs as the service unless the user asks for their session: nothing changes for existing tasks.
+        assert_eq!(task.run_as, RunAs::Service);
         assert_eq!(task.timeout_secs, None);
         assert_eq!(task.args, Vec::<String>::new());
     }
@@ -683,6 +689,7 @@ mod tests {
         task.timeout_secs = Some(5400);
         task.allow_concurrent = true;
         task.capture_logs = false;
+        task.run_as = RunAs::UserSession;
         task.schedule_enabled = false;
 
         for schedule in [

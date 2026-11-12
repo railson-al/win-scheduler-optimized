@@ -1,7 +1,10 @@
 //! Launches a script as a child process, streams its output and enforces
 //! timeout / cancellation by killing the whole process tree.
 
+#[cfg(windows)]
+mod interactive;
 mod tree;
+mod winlaunch;
 
 use std::ffi::OsString;
 use std::io;
@@ -16,7 +19,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::models::{ExecutionStatus, ScriptKind, Settings, Task};
+use crate::models::{ExecutionStatus, RunAs, ScriptKind, Settings, Task};
 use tree::ProcessTree;
 
 /// Longest chunk emitted as a single log line; longer lines are split so a
@@ -151,10 +154,64 @@ fn describe_abnormal_exit(_status: ExitStatus) -> String {
 /// A spawned script. Dropping it without calling [`RunningProcess::wait`]
 /// kills the main process.
 pub struct RunningProcess {
-    child: Child,
+    process: Process,
     tree: ProcessTree,
     readers: Vec<JoinHandle<()>>,
     pid: Option<u32>,
+}
+
+/// What is actually running: an ordinary child of this process, or (Windows only) a program started in
+/// the logged-on user's session, which `tokio::process` cannot start (see `interactive.rs`).
+// One per running script, so boxing the big variant would only add an allocation.
+#[allow(clippy::large_enum_variant)]
+enum Process {
+    Child(Child),
+    #[cfg(windows)]
+    UserSession(interactive::UserProcess),
+}
+
+impl Process {
+    async fn wait(&mut self) -> io::Result<ExitStatus> {
+        match self {
+            Self::Child(child) => child.wait().await,
+            #[cfg(windows)]
+            Self::UserSession(process) => process.wait().await,
+        }
+    }
+
+    /// Ends the main process directly (the tree is killed separately) and reaps it.
+    async fn kill(&mut self) {
+        match self {
+            Self::Child(child) => {
+                let _ = child.kill().await;
+            }
+            #[cfg(windows)]
+            Self::UserSession(process) => process.kill(),
+        }
+    }
+}
+
+/// Starts the task's script where the task says it runs: as the service (an ordinary child), or in the
+/// session of the user who is logged on. The second exists on Windows only, and fails with a clear
+/// reason when nobody is logged on.
+pub fn spawn_as(run_as: RunAs, plan: &CommandPlan, logs: Option<mpsc::Sender<LogLine>>) -> io::Result<RunningProcess> {
+    match run_as {
+        RunAs::Service => spawn(plan, logs),
+        RunAs::UserSession => spawn_in_user_session(plan, logs),
+    }
+}
+
+#[cfg(windows)]
+fn spawn_in_user_session(plan: &CommandPlan, logs: Option<mpsc::Sender<LogLine>>) -> io::Result<RunningProcess> {
+    interactive::spawn(plan, logs)
+}
+
+#[cfg(not(windows))]
+fn spawn_in_user_session(_plan: &CommandPlan, _logs: Option<mpsc::Sender<LogLine>>) -> io::Result<RunningProcess> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "running a task in the user's session is only available on Windows",
+    ))
 }
 
 /// Starts the process. Output lines are sent to `logs` (bounded, so a slow
@@ -186,7 +243,7 @@ pub fn spawn(plan: &CommandPlan, logs: Option<mpsc::Sender<LogLine>>) -> io::Res
         readers.push(tokio::spawn(pump(stderr, LogStream::Stderr, logs)));
     }
     Ok(RunningProcess {
-        child,
+        process: Process::Child(child),
         tree,
         readers,
         pid,
@@ -208,7 +265,7 @@ impl RunningProcess {
         }
 
         let end = tokio::select! {
-            status = self.child.wait() => End::Exited(status),
+            status = self.process.wait() => End::Exited(status),
             _ = sleep_or_pending(timeout) => End::TimedOut,
             _ = cancel.cancelled() => End::Cancelled,
         };
@@ -239,7 +296,7 @@ impl RunningProcess {
         self.tree.kill();
         // Also kills the main process directly (fallback if the tree could not
         // be tracked) and reaps it.
-        let _ = self.child.kill().await;
+        self.process.kill().await;
     }
 
     async fn drain_readers(&mut self) {
@@ -334,6 +391,19 @@ mod plan_tests {
 
     fn os(args: &[&str]) -> Vec<OsString> {
         args.iter().map(OsString::from).collect()
+    }
+
+    /// Off Windows there is no user session to start a script in. Refusing says so; running it as the service
+    /// instead would silently do something the task did not ask for.
+    #[cfg(not(windows))]
+    #[test]
+    fn running_in_the_users_session_is_refused_where_it_does_not_exist() {
+        let plan = plan_command(&Task::new("t", "a.sh"), &Settings::default());
+        let error = spawn_as(RunAs::UserSession, &plan, None)
+            .err()
+            .expect("must be refused");
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("only available on Windows"), "{error}");
     }
 
     #[test]

@@ -11,7 +11,7 @@ cron = "0.17.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
-tokio = { version = "1.54.1", features = ["process", "io-util", "sync", "time", "rt", "macros"] }
+tokio = { version = "1.54.1", features = ["fs", "process", "io-util", "sync", "time", "rt", "macros"] }
 tokio-util = "0.7.20"
 tracing = "0.1.44"
 uuid = { version = "1.29.2", features = ["v4"] }
@@ -24,4 +24,15 @@ tempfile = "3.27.0"
 libc = "0.2.191"
 
 [target."cfg(windows)".dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Globalization", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security"] }
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Security",
+    # Running a script in the logged-on user's session (executor/interactive.rs).
+    "Win32_Storage_FileSystem",
+    "Win32_System_Environment",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Threading",
+] }

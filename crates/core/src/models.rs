@@ -162,6 +162,25 @@ impl ExecutionStatus {
     }
 }
 
+/// Where a task's script runs. The scheduler is a Windows service (LocalSystem, session 0), and a program
+/// started there has no desktop: a browser it opens is real but invisible, and it sees the machine's
+/// profile, not a person's (no OneDrive, no mapped drives, no saved logins).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunAs {
+    /// In the service's own session, as the service. Works with nobody logged on. The default.
+    #[default]
+    Service,
+    /// In the session of the user who is logged on, with that user's profile and a visible desktop. Needs
+    /// someone logged on when it fires; without one the execution fails with a clear reason.
+    UserSession,
+}
+
+string_enum!(RunAs {
+    Service => "service",
+    UserSession => "user_session",
+});
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Task {
     pub id: TaskId,
@@ -180,6 +199,9 @@ pub struct Task {
     pub timeout_secs: Option<u64>,
     pub allow_concurrent: bool,
     pub capture_logs: bool,
+    /// Absent in what older versions stored or sent: they meant `Service`.
+    #[serde(default)]
+    pub run_as: RunAs,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -202,6 +224,7 @@ impl Task {
             timeout_secs: None,
             allow_concurrent: false,
             capture_logs: true,
+            run_as: RunAs::Service,
             created_at: now,
             updated_at: now,
         }
@@ -393,6 +416,31 @@ mod tests {
         assert!(t.validate().is_err());
         t.timeout_secs = Some(5);
         assert!(t.validate().is_ok());
+    }
+
+    /// What an older client or database sent has no `run_as`; it must mean what it always meant.
+    #[test]
+    fn a_task_without_run_as_runs_as_the_service() {
+        let mut value = serde_json::to_value(Task::new("t", "a.bat")).unwrap();
+        assert_eq!(value["run_as"], "service");
+        value.as_object_mut().unwrap().remove("run_as");
+        let task: Task = serde_json::from_value(value).unwrap();
+        assert_eq!(task.run_as, RunAs::Service);
+
+        let mut here = Task::new("t", "a.bat");
+        here.run_as = RunAs::UserSession;
+        let json = serde_json::to_string(&here).unwrap();
+        assert!(json.contains(r#""run_as":"user_session""#), "{json}");
+        assert_eq!(serde_json::from_str::<Task>(&json).unwrap().run_as, RunAs::UserSession);
+    }
+
+    #[test]
+    fn run_as_round_trips_through_its_text() {
+        for run_as in [RunAs::Service, RunAs::UserSession] {
+            assert_eq!(run_as.as_str().parse::<RunAs>().unwrap(), run_as);
+        }
+        assert!("elsewhere".parse::<RunAs>().is_err());
+        assert_eq!(RunAs::default(), RunAs::Service);
     }
 
     #[test]

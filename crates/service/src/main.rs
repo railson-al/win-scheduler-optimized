@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Local, NaiveTime, Utc, Weekday};
 use clap::{Args, Parser, Subcommand};
 use scriptrunner_core::logs::LogKind;
-use scriptrunner_core::{Execution, ExecutionId, ExecutionQuery, ExecutionStatus, Schedule, ScriptKind, Task};
+use scriptrunner_core::{Execution, ExecutionId, ExecutionQuery, ExecutionStatus, RunAs, Schedule, ScriptKind, Task};
 use scriptrunner_ipc::Event;
 use scriptrunner_ipc::client::{Client, ClientError, LOG_CHUNK_BYTES};
 use scriptrunner_ipc::transport::Endpoint;
@@ -94,6 +94,10 @@ struct AddArgs {
     /// Allow overlapping runs of this task.
     #[arg(long)]
     concurrent: bool,
+    /// Run in the session of the user who is logged on (visible windows, that user's profile), not as the
+    /// service. Windows only; the task fails when nobody is logged on.
+    #[arg(long)]
+    user_session: bool,
     /// Every N minutes/hours, e.g. `15m` or `2h`.
     #[arg(long, conflicts_with_all = ["daily", "weekly", "cron"])]
     every: Option<String>,
@@ -267,6 +271,9 @@ async fn run_client_command(client: &Client, command: Command) -> Result<()> {
             task.working_dir = args.workdir.clone();
             task.timeout_secs = args.timeout;
             task.allow_concurrent = args.concurrent;
+            if args.user_session {
+                task.run_as = RunAs::UserSession;
+            }
             task.schedule = build_schedule(&args)?;
             let task = client.create_task(task).await?;
             println!("created {} ({})", task.name, &task.id.as_str()[..8]);

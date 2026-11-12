@@ -7,7 +7,8 @@ use chrono::{DateTime, Local, Utc};
 use scriptrunner_core::executor::{self, LogLine, RunOutcome};
 use scriptrunner_core::logs::{self, LogChunk, LogEntry, LogWriter};
 use scriptrunner_core::{
-    CoreError, Execution, ExecutionId, ExecutionQuery, ExecutionStatus, Settings, Task, TaskId, TaskOverview, Trigger,
+    CoreError, Execution, ExecutionId, ExecutionQuery, ExecutionStatus, RunAs, Settings, Task, TaskId, TaskOverview,
+    Trigger,
 };
 use scriptrunner_storage::{ScheduledSlot, Storage, StorageError};
 use thiserror::Error;
@@ -491,7 +492,11 @@ impl Engine {
                 Ok(mut w) => {
                     let args: Vec<_> = plan.args.iter().map(|a| a.to_string_lossy()).collect();
                     let _ = w.write_meta(&format!(
-                        "started: {} {}",
+                        "started{}: {} {}",
+                        match task.run_as {
+                            RunAs::Service => "",
+                            RunAs::UserSession => " (in the user's session)",
+                        },
                         plan.program.to_string_lossy(),
                         args.join(" ")
                     ));
@@ -531,7 +536,7 @@ impl Engine {
             .timeout_secs
             .or(settings.default_timeout_secs)
             .map(Duration::from_secs);
-        let outcome = match executor::spawn(&plan, sink) {
+        let outcome = match executor::spawn_as(task.run_as, &plan, sink) {
             Ok(process) => process.wait(timeout, &cancel).await,
             Err(err) => RunOutcome {
                 status: ExecutionStatus::Failed,
