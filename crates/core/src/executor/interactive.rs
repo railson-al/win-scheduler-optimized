@@ -33,7 +33,8 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GENERIC_READ, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+    CloseHandle, GENERIC_READ, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::{
     DuplicateTokenEx, GetTokenInformation, SECURITY_ATTRIBUTES, SecurityImpersonation, TOKEN_ALL_ACCESS,
@@ -50,9 +51,9 @@ use windows_sys::Win32::System::RemoteDesktop::{
 };
 use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
-    DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE,
-    InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, ResumeThread,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+    DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, InitializeProcThreadAttributeList,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 use super::tree::ProcessTree;
@@ -67,6 +68,9 @@ const NO_SESSION: u32 = 0xFFFF_FFFF;
 
 const NO_USER: &str = "no user is logged on to a desktop session, so a task set to run in the user's session \
                        cannot start (log in, or set the task to run as the service)";
+
+/// How long the thread waiting for a script to end sleeps between checks that someone still wants the answer.
+const WAIT_INTERVAL_MS: u32 = 500;
 
 /// An open Win32 handle, closed when dropped.
 struct Handle(HANDLE);
@@ -316,7 +320,7 @@ impl AttributeList {
             return Err(failed("creating the process attribute list"));
         }
         // From here `Drop` deletes the (initialised) list.
-        let list = Self { buffer };
+        let mut list = Self { buffer };
         // SAFETY: the list is initialised; `handles` is a valid slice that outlives the process creation.
         let updated = unsafe {
             UpdateProcThreadAttribute(
@@ -335,8 +339,11 @@ impl AttributeList {
         Ok(list)
     }
 
-    fn pointer(&self) -> *mut c_void {
-        self.buffer.as_ptr() as *mut c_void
+    /// The list as the Win32 calls want it. They write through it, so it is derived from a mutable borrow
+    /// (a pointer made from `&self` would be undefined behaviour to write through). The buffer is never
+    /// resized, so the address stays valid for the life of the list.
+    fn pointer(&mut self) -> *mut c_void {
+        self.buffer.as_mut_ptr().cast::<c_void>()
     }
 }
 
@@ -424,12 +431,17 @@ pub fn spawn(plan: &CommandPlan, logs: Option<mpsc::Sender<LogLine>>) -> io::Res
         command_line(&resolved, &args)
     };
 
+    // From the moment an inheritable handle exists until the service's copies are closed below, no other
+    // child may be started (`spawn` takes the same lock): `CreateProcess` with `bInheritHandles` and no
+    // handle list would hand it the script's pipes, and they would never report the end of the output.
+    // Declared first, so on an early return it is released after the handles below are closed.
+    let spawn_guard = super::spawn_lock();
     let stdin = nul_device()?;
     let stdout = pipe()?;
     let stderr = pipe()?;
     // Declared before the attribute list, which refers to it, so it is dropped after it.
     let inherited = [stdin.0, stdout.write.0, stderr.write.0];
-    let attributes = AttributeList::inheriting(&inherited)?;
+    let mut attributes = AttributeList::inheriting(&inherited)?;
 
     let mut command = wide(&line);
     let mut desktop = wide(r"winsta0\default");
@@ -476,13 +488,25 @@ pub fn spawn(plan: &CommandPlan, logs: Option<mpsc::Sender<LogLine>>) -> io::Res
     let (sender, exit) = oneshot::channel();
     let waiting_on = Arc::clone(&process);
     tokio::task::spawn_blocking(move || {
-        let mut code = 0u32;
-        // SAFETY: a live process handle, kept open by the `Arc` for the whole wait.
-        unsafe {
-            WaitForSingleObject(waiting_on.0, INFINITE);
-            GetExitCodeProcess(waiting_on.0, &mut code);
+        // A bounded wait, so this thread never outlives whoever was waiting for it: when the
+        // `UserProcess` is dropped (a cancelled task, a runtime shutting down) the receiver closes and the
+        // loop ends within one interval, instead of holding the runtime's shutdown until the script exits.
+        loop {
+            // SAFETY: a live process handle, kept open by the `Arc` for the whole wait.
+            let waited = unsafe { WaitForSingleObject(waiting_on.0, WAIT_INTERVAL_MS) };
+            if waited == WAIT_OBJECT_0 {
+                break;
+            }
+            if waited != WAIT_TIMEOUT || sender.is_closed() {
+                // Failed to wait, or nobody is listening: the sender is dropped, which `wait` reports.
+                return;
+            }
         }
-        let _ = sender.send(code);
+        let mut code = 0u32;
+        // SAFETY: as above; the process has ended.
+        if unsafe { GetExitCodeProcess(waiting_on.0, &mut code) } != 0 {
+            let _ = sender.send(code);
+        }
     });
     let user_process = UserProcess {
         process: Arc::clone(&process),
@@ -501,6 +525,7 @@ pub fn spawn(plan: &CommandPlan, logs: Option<mpsc::Sender<LogLine>>) -> io::Res
     drop(stdin);
     drop(stdout.write);
     drop(stderr.write);
+    drop(spawn_guard);
     let mut readers = Vec::with_capacity(2);
     for (pipe_end, stream) in [(stdout.read, LogStream::Stdout), (stderr.read, LogStream::Stderr)] {
         // SAFETY: a pipe handle we own, whose ownership passes to the `File`.

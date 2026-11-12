@@ -214,6 +214,14 @@ fn spawn_in_user_session(_plan: &CommandPlan, _logs: Option<mpsc::Sender<LogLine
     ))
 }
 
+/// Serialises the moments at which a child process is created, so that handles made inheritable for one
+/// child (the user-session pipes) cannot be inherited by another. Held briefly and never across an `await`.
+fn spawn_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // Nothing is protected by the lock but the ordering, so a panic while holding it changes nothing.
+    LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Starts the process. Output lines are sent to `logs` (bounded, so a slow
 /// consumer applies back-pressure instead of growing memory); when `None`,
 /// the pipes are still drained and discarded so the script never blocks.
@@ -231,7 +239,11 @@ pub fn spawn(plan: &CommandPlan, logs: Option<mpsc::Sender<LogLine>>) -> io::Res
     }
     tree::configure(&mut command);
 
+    // Not while a script is being started in the user's session: its pipes are inheritable for a moment
+    // (see `interactive::spawn`), and this child would inherit them.
+    let spawn_guard = spawn_lock();
     let mut child = command.spawn()?;
+    drop(spawn_guard);
     let tree = ProcessTree::attach(&child);
     let pid = child.id();
 
