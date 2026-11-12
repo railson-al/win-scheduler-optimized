@@ -4,9 +4,11 @@ Agendador de scripts para Windows escrito em Rust: cadastra, agenda, executa e m
 scripts (`.py`, `.bat`, `.cmd`, `.ps1`, `.exe`) com histórico e logs, sem depender do
 Task Scheduler.
 
-**Estado atual:** motor (fase 1), IPC local (leva 1) e serviço do Windows (leva 2) prontos. O `daemon`
-roda em modo console, e o serviço `ScriptRunner` roda o mesmo daemon como serviço do Windows. A CLI
-`scriptrunner` fala com o daemon por IPC. A GUI (egui) ainda não existe.
+**Estado atual:** motor (fase 1), IPC local (leva 1), serviço do Windows (leva 2) e interface gráfica (leva 3)
+prontos. O `daemon` roda em modo console, e o serviço `ScriptRunner` roda o mesmo daemon como serviço do
+Windows. A CLI `scriptrunner` e a GUI `scriptrunner-gui` (egui) são clientes do daemon por IPC. A GUI tem
+painel, histórico, configurações, editor de tarefas e logs, e ainda está em validação no Windows. O que
+falta da leva 3 (testes de UI, CI da GUI, revisão) está em `docs/PLANO-LEVA-3.md`.
 
 O desenvolvedor trabalha no Linux, então as partes específicas do Windows (pipe, serviço, ACLs) não
 puderam ser executadas localmente. Elas são checadas pelo CI do Windows e pelo checklist manual abaixo.
@@ -20,6 +22,7 @@ puderam ser executadas localmente. Elas são checadas pelo CI do Windows e pelo 
 | `crates/ipc` | Protocolo (frames JSON), transporte (named pipe com ACL restrita a SYSTEM e Administradores; socket Unix no Linux) e cliente; não depende de SQLite |
 | `crates/winsvc` | Plumbing do serviço Windows: dispatcher do SCM, instalação e remoção, permissões da pasta de dados. Vazio fora do Windows; não depende de SQLite |
 | `crates/service` | Motor (agendador + execuções), servidor IPC e a CLI `scriptrunner` |
+| `crates/gui` | A janela `scriptrunner-gui` (egui/eframe com wgpu). Cliente do daemon por IPC; não depende de SQLite |
 
 ## Compilar e testar no Windows
 
@@ -31,7 +34,47 @@ cargo test --workspace
 cargo build --release
 ```
 
-O executável fica em `target\release\scriptrunner.exe`.
+Os executáveis ficam em `target\release\`: `scriptrunner.exe` (CLI e daemon) e `scriptrunner-gui.exe` (a janela).
+
+### Debug ou release
+
+| | `cargo build` (debug) | `cargo build --release` |
+|---|---|---|
+| Saída | `target\debug\` | `target\release\` |
+| Compilação | rápida | bem mais lenta (`lto = "thin"`, `codegen-units = 1`) |
+| Execução | lenta, sem otimização | rápida |
+| Tamanho do `.exe` | grande, com símbolos | menor (`strip = true`) |
+| `debug_assert!` e estouro de inteiro | checados (panic) | desligados |
+
+Os dois perfis compilam o mesmo código, e um não atualiza o outro. Use **debug** no desenvolvimento e nos
+testes (é o que o CI usa) e **release** para o uso de verdade e para medir desempenho. Todos os exemplos
+deste README usam o release. O alvo `make service-reinstall` usa o debug.
+
+Compilar não exige o serviço rodando. O serviço (ou o `daemon` em modo console) só é necessário para **usar** a
+CLI e a GUI, que são clientes dele.
+
+## Instalar numa máquina nova (`win-installer.bat`)
+
+Com os pré-requisitos acima (Rust e Build Tools) e o repositório clonado, o `win-installer.bat` faz tudo para o
+programa funcionar. Execute-o como administrador (botão direito, *Executar como administrador*):
+
+```powershell
+git clone https://github.com/railson-al/win-scheduler-optimized.git
+cd win-scheduler-optimized
+.\win-installer.bat
+```
+
+Ele confere se está elevado e se o `cargo` existe, compila o release (`scriptrunner` e `scriptrunner-gui`),
+remove uma instalação anterior do serviço se houver (os dados são mantidos), instala o serviço `ScriptRunner`,
+o inicia e mostra o estado. Para **atualizar** depois de um `git pull`, execute-o de novo.
+
+- Argumentos são repassados ao `service install`, por exemplo `.\win-installer.bat --data-dir D:\scriptrunner\dados`.
+- `set NO_PAUSE=1` antes de executar dispensa a espera de uma tecla no final (para automação).
+- Depois da instalação, abra a GUI com `.\target\release\scriptrunner-gui.exe` (pede elevação) ou use a CLI em
+  um terminal elevado, como em *Usar a CLI*.
+- O `service install` copia só o `scriptrunner.exe` para `%ProgramFiles%\ScriptRunner`, então o serviço continua
+  de pé mesmo que `target\` seja apagado. A GUI não é copiada: ela roda de onde foi compilada. Um instalador
+  completo fica para a fase 4.
 
 ## Usar a CLI
 
@@ -81,7 +124,13 @@ O caminho fica gravado no serviço.
 
 - **Conta: LocalSystem.** Os scripts rodam como SYSTEM, na sessão 0: nenhuma janela aparece para o
   usuário, não há unidades de rede mapeadas nem perfil do usuário (HKCU). O acesso à rede usa a conta
-  da máquina. Executar como usuário fica para uma etapa futura.
+  da máquina. Isso vale para as tarefas comuns.
+- **Tarefa na sessão do usuário logado.** Uma tarefa pode ser marcada para rodar na sessão de quem está
+  logado, como um duplo clique daria: a janela aparece (um navegador com `headless=False`, por exemplo), com o
+  perfil, o PATH e as variáveis do usuário. Na GUI é a caixa *Executar na sessão do usuário logado*; na CLI,
+  `add --user-session`. Limites: precisa haver alguém logado quando a tarefa dispara (senão a execução falha
+  com uma mensagem clara), com a tela bloqueada a janela abre atrás da tela de bloqueio, e roda como quem
+  estiver logado, sem escolher outro usuário. Só funciona no Windows.
 - **Quem fala com o pipe: só SYSTEM e Administradores.** Por isso `list`, `run` e os demais comandos
   precisam de terminal elevado. Sem elevação, a CLI pede para executar como Administrador.
 - **Dados e logs.** A pasta padrão é `%ProgramData%\ScriptRunner`. Ela fica restrita a SYSTEM e
@@ -144,7 +193,7 @@ Checklist manual do serviço (só dá para confirmar no Windows):
 - O runner é administrador, então esse job não detecta erro de permissão para usuário comum. Por isso existe o
   item 3 do checklist manual (terminal sem elevação).
 - A toolchain é fixada em `rust-toolchain.toml` (Rust 1.99.1); o mínimo suportado é 1.88, por causa da edition 2024 e de let-chains.
-- Os planos de desenvolvimento estão em `docs/PLANO-LEVA-0-1.md` (levas 0 e 1) `docs/PLANO-LEVA-2.md` (serviço do Windows) e `docs/PLANO-LEVA-3.md` (interface gráfica, ainda por fazer).
+- Os planos de desenvolvimento estão em `docs/PLANO-LEVA-0-1.md` (levas 0 e 1) `docs/PLANO-LEVA-2.md` (serviço do Windows) e `docs/PLANO-LEVA-3.md` (interface gráfica, em andamento).
 
 ## Desenvolvimento no Linux
 
@@ -160,4 +209,4 @@ O `Makefile` reúne esses comandos e funciona no Linux e no Windows (no Windows 
 sem precisar de `sh` nem `awk`). `make` lista os alvos; os principais são `make ci` (formatação, clippy e testes,
 como o CI; no Linux inclui também o clippy do código Windows), `make daemon` e `make sr ARGS="list"` (daemon e CLI
 com uma pasta de dados de desenvolvimento) e `make gui`. No Windows, em terminal elevado, `make service-reinstall`
-compila, reinstala o serviço com o novo `.exe` e o inicia.
+compila (em debug), reinstala o serviço com o novo `.exe` e o inicia. Para o release, use o `win-installer.bat`.

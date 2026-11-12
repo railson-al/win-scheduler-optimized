@@ -1,0 +1,4 @@
+# Arquivos de lote do Windows precisam de CRLF, com qualquer configuracao de autocrlf:
+# .bat com LF puro pode quebrar rotulos e goto no cmd.exe.
+*.bat text eol=crlf
+*.cmd text eol=crlf
