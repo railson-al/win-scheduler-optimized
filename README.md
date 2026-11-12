@@ -156,6 +156,8 @@ rustup target add x86_64-pc-windows-gnu
 cargo check -p scriptrunner-core --target x86_64-pc-windows-gnu --all-targets
 ```
 
-O `Makefile` reúne esses comandos. `make` lista os alvos; os principais são `make ci` (formatação, clippy no
-Linux e no código Windows, e testes, como o CI), `make daemon` e `make sr ARGS="list"` (daemon e CLI com uma
-pasta de dados de desenvolvimento), `make gui` e `make windows-steps` (imprime a sequência para testar no Windows).
+O `Makefile` reúne esses comandos e funciona no Linux e no Windows (no Windows as receitas rodam pelo `cmd.exe`,
+sem precisar de `sh` nem `awk`). `make` lista os alvos; os principais são `make ci` (formatação, clippy e testes,
+como o CI; no Linux inclui também o clippy do código Windows), `make daemon` e `make sr ARGS="list"` (daemon e CLI
+com uma pasta de dados de desenvolvimento) e `make gui`. No Windows, em terminal elevado, `make service-reinstall`
+compila, reinstala o serviço com o novo `.exe` e o inicia.
