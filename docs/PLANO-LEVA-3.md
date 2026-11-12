@@ -33,10 +33,11 @@ Assumidas por mim (me avise se discordar):
   então o crate `gui` declara o próprio `rust-version = "1.95"`. A toolchain fixada (1.99.1) cobre isso; o mínimo só
   importa a quem compilar com um compilador mais antigo. A 0.33.3 caberia nos 1.88, mas o Cargo só a escolhia por
   causa do filtro de MSRV. O `rfd` 0.18 (seletor de arquivo da 3.6) exige 1.92, o que também cabe.
-- **D14. Backend gráfico: decidir num teste em máquina Windows sem GPU (tarefa 3.1).** O OpenGL que a `glow` exige
-  pode não existir numa sessão RDP ou numa VM de servidor, que é justamente onde um agendador roda. A alternativa é
-  `wgpu` (DX12 com fallback de software). É um risco que conheço de memória e não verifiquei; só dá para confirmar no
-  Windows, então a 3.1 é um *spike* com critério de saída: abrir a janela por RDP.
+- **D14. Backend gráfico: `wgpu`. DECIDIDA pelo spike da 3.1 (12/11/2026), numa máquina Windows sem GPU.** O
+  `wgpu` abriu pelo DX12 com o adaptador de software do Windows ("Microsoft Basic Render Driver", tipo `Cpu`); o
+  `glow` falhou com "egui_glow requires opengl 2.0+". Confirma o risco que eu tinha anotado de memória: o OpenGL
+  não existe onde um agendador costuma rodar (RDP, VM de servidor). O `Cargo.toml` do `gui` tem só `wgpu`. Efeito
+  a vigiar: nessas máquinas a interface é desenhada pela CPU, então o log com muitas linhas (3.8) merece medição.
 - **D15. Elevação por manifesto:** o `.exe` da GUI embute um manifesto `requestedExecutionLevel =
   requireAdministrator`, para o Windows pedir UAC ao abrir. Sem isso, o usuário vê o erro de acesso negado do pipe,
   que a CLI já traduz para "execute como Administrador". No Linux (desenvolvimento) não há manifesto.
@@ -221,32 +222,20 @@ O que mudou em relação ao desenho acima:
 - Pequeno: `print!` da CLI entra em pânico com `Broken pipe` quando a saída é cortada (`scriptrunner logs ... | head`).
   Já existia; não mexi.
 
-### 3.1 Spike do backend gráfico: código pronto, falta rodar no Windows
+### 3.1 Spike do backend gráfico: concluída, decisão `wgpu`
 
-O crate `crates/gui` abre uma janela com o renderer pedido (`wgpu` por padrão, ou `glow`) e mostra qual adaptador
-e qual API gráfica ele realmente obteve, também no console. Compila e passa no clippy no Linux e no alvo Windows, e não
-puxa SQLite (`cargo tree`). No Linux, com GPU, os dois renderers abriram (`wgpu` por Vulkan na Iris Xe, `glow` com
-OpenGL 4.6), o que **não responde** à dúvida do RDP.
+O spike (um binário `graphics-spike` que abria uma janela com o renderer pedido e mostrava o adaptador obtido) foi
+rodado numa máquina Windows sem GPU. No Linux, com GPU, os dois renderers tinham aberto, o que não respondia à dúvida.
+Resultado no Windows:
 
-**O que só você consegue fazer, numa máquina Windows sem GPU (VM de servidor, ou sessão RDP):**
+| Renderer | Resultado |
+|---|---|
+| `wgpu` | abriu; adaptador "Microsoft Basic Render Driver", backend `Dx12`, tipo `Cpu` (software) |
+| `glow` | falhou: `OpenGL(PainterError("egui_glow requires opengl 2.0+. "))` |
 
-```powershell
-cargo build -p scriptrunner-gui --bin graphics-spike
-.\target\debug\graphics-spike.exe wgpu
-.\target\debug\graphics-spike.exe glow
-```
-
-Anote para cada um: se a janela abre e desenha, o texto do relatório (adaptador, backend, tipo de dispositivo) ou a
-mensagem de erro do console. Critério de decisão para D14:
-
-| `wgpu` | `glow` | Decisão |
-|---|---|---|
-| abre | abre | `wgpu`: é o padrão do eframe 0.37 e tem fallback de software |
-| abre | falha | `wgpu` (confirma o risco do OpenGL no RDP) |
-| falha | abre | `glow` |
-| falha | falha | parar e discutir (renderização por software ou outra biblioteca) |
-
-Depois da decisão, o `Cargo.toml` do `gui` passa a ter só o renderer escolhido.
+Pelo critério do plano (`wgpu` abre e `glow` falha), a decisão é `wgpu`. Feito em seguida: a feature `glow` saiu do
+`eframe` no `Cargo.toml` e o binário do spike foi removido (o código continua no histórico do git, commit `baac187`).
+Não confirmei se a janela do spike foi vista desenhando; só que o adaptador foi obtido e o relatório impresso.
 
 ### 3.2 Esqueleto e 3.3 Backend: prontas no Linux
 
@@ -260,8 +249,8 @@ O que existe:
 
 - **D20:** `core::paths::data_dir(explicit)` resolve a pasta de dados (argumento, depois `SCRIPTRUNNER_DATA_DIR`,
   depois o padrão da plataforma). O serviço usa a mesma função; a GUI também.
-- **Crate `gui` virou lib + dois binários.** `scriptrunner-gui` é a aplicação (esqueleto: barra de status e lista
-  de tarefas) e `graphics-spike` é o spike da 3.1, **renomeado**: o comando do Windows mudou (ver acima). O
+- **Crate `gui` virou lib + binário.** `scriptrunner-gui` é a aplicação (na época, esqueleto: barra de status e
+  lista de tarefas); o `graphics-spike` da 3.1 existiu aqui e foi removido depois da decisão da D14. O
   manifesto `requireAdministrator` (`build.rs`, só para o `scriptrunner-gui`, só MSVC) usa
   `/MANIFEST:EMBED` e `/MANIFESTUAC`; **a sintaxe das aspas desse argumento é de memória** e a 3.11 (conferir o
   `.exe` no CI do Windows) é quem confirma. No alvo GNU, usado só para checar tipos daqui, avisa e não embute.

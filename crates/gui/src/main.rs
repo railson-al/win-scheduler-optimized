@@ -13,7 +13,8 @@ use scriptrunner_ipc::transport::Endpoint;
 fn main() -> eframe::Result {
     let endpoint = Endpoint::for_data_dir(&paths::data_dir(None));
     let options = eframe::NativeOptions {
-        // wgpu is the provisional choice (D14), pending the spike on a Windows machine without a GPU.
+        // wgpu, decided by the spike on a Windows machine without a GPU (D14): it falls back to DX12's
+        // software adapter there, where OpenGL does not exist.
         renderer: eframe::Renderer::Wgpu,
         viewport: egui::ViewportBuilder::default()
             .with_title(t(Text::AppTitle))

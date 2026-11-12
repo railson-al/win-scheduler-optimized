@@ -17,17 +17,11 @@ path = "src/lib.rs"
 name = "scriptrunner-gui"
 path = "src/main.rs"
 
-# Task 3.1: opens a window with each renderer and reports what it got. Not elevated, so it can be
-# double-clicked on a test machine. Goes away once the renderer is decided (D14).
-[[bin]]
-name = "graphics-spike"
-path = "src/bin/graphics_spike.rs"
-
 [dependencies]
-# Both renderers are built so the spike can try either on a machine without a GPU (see
-# docs/PLANO-LEVA-3.md, task 3.1). The application itself asks for wgpu, the provisional choice;
-# the final build keeps only the renderer the spike picks.
-eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "glow", "wgpu", "wayland", "x11"] }
+# wgpu only (plan D14). The spike on a Windows machine with no GPU showed wgpu opening through DX12's
+# software adapter ("Microsoft Basic Render Driver"), while glow failed there ("requires opengl 2.0+").
+# Do not add the glow feature back: a scheduler's GUI is often opened over RDP or on a server VM.
+eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 # The editor's "choose a file" dialogs (3.6). It blocks, so the editor runs it on a thread of its own.
 rfd = "0.18.0"
