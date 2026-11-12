@@ -122,10 +122,13 @@ pub fn install(source_executable: &Path, data_dir: &Path) -> Result<()> {
         account_name: None,
         account_password: None,
     };
+    // START is not for starting the service here: Windows refuses to set restart-on-failure actions
+    // (`configure`) on a handle that lacks it, with ERROR_ACCESS_DENIED, even for an administrator.
+    // The `windows-service` documentation shows the same pair, START | CHANGE_CONFIG, for that call.
     let service = manager
         .create_service(
             &info,
-            ServiceAccess::CHANGE_CONFIG | ServiceAccess::QUERY_STATUS | ServiceAccess::DELETE,
+            ServiceAccess::CHANGE_CONFIG | ServiceAccess::QUERY_STATUS | ServiceAccess::DELETE | ServiceAccess::START,
         )
         .map_err(explain)
         .context("creating the service")?;
@@ -139,8 +142,13 @@ pub fn install(source_executable: &Path, data_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Each step says what it was doing: `explain` alone turns any ERROR_ACCESS_DENIED into "run this command as
+/// Administrator", which misleads when the caller already is one and the handle merely lacks a right.
 fn configure(service: &Service) -> Result<()> {
-    service.set_description(DESCRIPTION).map_err(explain)?;
+    service
+        .set_description(DESCRIPTION)
+        .map_err(explain)
+        .context("setting the service description")?;
     service
         .update_failure_actions(ServiceFailureActions {
             reset_period: ServiceFailureResetPeriod::After(FAILURE_RESET_AFTER),
@@ -156,11 +164,13 @@ fn configure(service: &Service) -> Result<()> {
                     .collect(),
             ),
         })
-        .map_err(explain)?;
+        .map_err(explain)
+        .context("setting the restart-on-failure actions")?;
     // A non-zero exit code also counts as a failure, not only a crash.
     service
         .set_failure_actions_on_non_crash_failures(true)
-        .map_err(explain)?;
+        .map_err(explain)
+        .context("applying the failure actions to non-zero exit codes")?;
     set_preshutdown_timeout(PRESHUTDOWN_TIMEOUT).context("setting the shutdown timeout")?;
     Ok(())
 }
